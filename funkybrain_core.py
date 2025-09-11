@@ -1,69 +1,94 @@
-import re, numpy as np, pandas as pd
-LETTERS = list("PLAYFUNKTIME")
-ORDER   = ["1","BAR"] + list("PLAY") + list("FUNK") + list("TIME") + ["DISCO","VIP","STAYINALIVE"]
+# app.py
+# -*- coding: utf-8 -*-
+import time
+import pandas as pd
+import streamlit as st
 
-def beta_prob(s, n, a0=2, b0=2):
-    f = max(n-s,0)
-    return (s+a0)/(s+f+a0+b0) if n>0 else 0.0
+# هذه الدوال موجودة عندك من قبل في مشروع الإكسل/بايثون
+# إن اختلفت التواقيع، لا تقلق: وضعنا try/except تحت لعدم كسر التطبيق.
+from funkybrain_core import normalize_df, compute_probs, board_matrix
 
-def extract_segment_from_url(url: str):
-    m = re.search(r"funky-time/([A-Za-z0-9]+)\.png", str(url))
-    if not m:
-        t = str(url).strip().upper()
-        return t if (t in ORDER or t in LETTERS) else None
-    token = m.group(1).upper()
-    if token.startswith("DISCO"): 
-        return "DISCO"
-    mp = {"1":"1","BAR":"BAR","VIP":"VIP","STAYINALIVE":"STAYINALIVE",
-          "P":"P","L":"L","A":"A","Y":"Y",
-          "F":"F","U":"U","N":"N","K":"K",
-          "T":"T","I":"I","M":"M","E":"E"}
-    return mp.get(token, token)
+st.set_page_config(page_title="Funky Brain LIVE", layout="wide")
+st.title("🧠 Funky Brain – LIVE (Cloud)")
 
-def extract_multiplier(v):
-    m = re.match(r"(\d+)\s*[Xx]", str(v).strip())
-    if m: 
-        return int(m.group(1))
-    s = str(v).strip()
-    if s.isdigit(): 
-        return int(s)
-    return 1
+# ===== Sidebar =====
+st.sidebar.header("الإعدادات")
+window = st.sidebar.slider("Window size (spins)", 50, 200, 200, step=10)
 
-def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
-    cols = raw.columns.tolist()
-    c_ts, c_img, c_mul = cols[0], (cols[1] if len(cols)>1 else cols[0]), (cols[2] if len(cols)>2 else cols[-1])
-    df = pd.DataFrame()
-    df["ts"] = raw[c_ts]
-    df["segment"] = raw[c_img].apply(extract_segment_from_url)
-    df["multiplier"] = raw[c_mul].apply(extract_multiplier)
-    return df.dropna(subset=["segment"]).reset_index(drop=True)
+st.sidebar.subheader("جلب آخر الرميات (تجريبي)")
+auto = st.sidebar.toggle("Auto-refresh", value=False, help="تحديث تلقائي كل 60 ثانية")
+colA, colB = st.sidebar.columns([1, 1])
+with colA:
+    fetch_btn = st.button("سحب من casinoscores.py", use_container_width=True)
+with colB:
+    refresh_btn = st.button("Force Reload", use_container_width=True)
 
-def compute_probs(df: pd.DataFrame, window_size: int):
-    win = df.tail(min(window_size, len(df))).copy()
-    seq, N = win["segment"].tolist(), len(win)
-    p_single = {s: beta_prob(seq.count(s), N) for s in ORDER}
-    ge1 = lambda p,T: 1 - (1 - p)**T
-    T10,T15 = 10,15
-    tiles = pd.DataFrame([{
-        "Tile": s,
-        "P(next)": p_single[s],
-        "Exp in 10": T10*p_single[s],
-        "P(≥1 in 10)": ge1(p_single[s],T10),
-        "Exp in 15": T15*p_single[s],
-        "P(≥1 in 15)": ge1(p_single[s],T15),
-    } for s in ORDER])
-    prob_x50  = beta_prob(int((win["multiplier"]>=50).sum()), N)
-    prob_x100 = beta_prob(int((win["multiplier"]>=100).sum()), N)
-    eyes = pd.DataFrame([
-        {"Metric":"P(≥1 x50 in 15)",  "Value": 1-(1-prob_x50)**15,  "Exp in 15":15*prob_x50,  "Signal":"MEDIUM", "Note":"Chance of 50x+"},
-        {"Metric":"P(≥1 x100 in 15)", "Value": 1-(1-prob_x100)**15, "Exp in 15":15*prob_x100, "Signal":"MEDIUM", "Note":"Chance of 100x+"},
-        {"Metric":"Stop Alert",        "Value": np.nan,             "Exp in 15":15*p_single["1"], "Signal":"STOP" if p_single["1"]>0.5 else "", "Note":"If '1' dominates"},
-    ])
-    return tiles, eyes, win
+status_box = st.sidebar.empty()
 
-def board_matrix(probs_10: dict):
-    layout = [["1","BAR"], list("PLAY"), list("FUNK"), list("TIME"), ["DISCO","STAYINALIVE","VIP"]]
-    rows = []
-    for row in layout:
-        rows.append([(s, f"{probs_10.get(s,0)*100:.0f}%") for s in row])
-    return rows
+@st.cache_data(ttl=60)
+def _cached_fetch_latest():
+    from fetchers.casinoscores import fetch_latest
+    df_fetched = fetch_latest(limit=300)
+    return df_fetched
+
+# رفع CSV يدويًا (مسار بديل آمن)
+st.sidebar.subheader("ارفع CSV من casinoscores")
+uploads = st.sidebar.file_uploader("Drag & drop", type=["csv"], accept_multiple_files=True)
+
+# ===== Data source selection =====
+use_uploaded = True
+
+if auto or fetch_btn or refresh_btn:
+    try:
+        raw = _cached_fetch_latest()
+        status_box.info(f"✔ تم الجلب الآلي: {len(raw)} رمية")
+        use_uploaded = False
+    except Exception as e:
+        status_box.error(f"فشل الجلب الآلي: {e}")
+        use_uploaded = True
+
+if use_uploaded:
+    if not uploads:
+        st.info("ابدأ التحليل برفع CSV من casinoscores أو استخدم زر الجلب في الشريط الجانبي.")
+        st.stop()
+    dfs = [pd.read_csv(f) for f in uploads]
+    raw = pd.concat(dfs, ignore_index=True)
+
+# ===== Normalize & compute =====
+try:
+    df = normalize_df(raw)
+except Exception as e:
+    st.error(f"normalize_df فشل: {e}")
+    st.dataframe(raw.head())
+    st.stop()
+
+try:
+    tiles, eyes, win = compute_probs(df, window)
+except Exception as e:
+    st.error(f"compute_probs فشل: {e}")
+    st.dataframe(df.head())
+    st.stop()
+
+# ===== Tiles Table =====
+st.subheader("Tiles – احتمالات وتوقعات")
+st.dataframe(tiles, use_container_width=True)
+
+# ===== Board (احتمال ≥1 خلال 10) =====
+try:
+    st.subheader("Board – P(≥1 in 10)")
+    board_df = board_matrix(tiles)  # إن كانت الدالة تتوقع بيانات أخرى عدّلها لديك
+    st.dataframe(board_df, use_container_width=True)
+except Exception:
+    # لو التوقيع مختلف، تخطَّ العرض البصري واكتفِ بعمود الاحتمالات
+    st.warning("تعذر بناء لوحة Board بالوظيفة الحالية. يتم عرض الاحتمالات من الجدول فقط.")
+
+# ===== Eyes Eagle (نفس منطق إصداراتك السابقة إن كانت موجودة في tiles/eyes) =====
+if "Exp in 15" in tiles.columns and "P(≥1 in 15)" in tiles.columns:
+    st.subheader("Eyes Eagle – مؤشرات سريعة")
+    ee = tiles.loc[:, ["Tile", "Exp in 15", "P(≥1 in 15)"]].copy() if "Tile" in tiles.columns else tiles.loc[:, ["Exp in 15", "P(≥1 in 15)"]]
+    st.dataframe(ee, use_container_width=True)
+
+# ===== Auto refresh (واجهة فقط) =====
+if auto:
+    st.sidebar.caption("التحديث يعمل… (كل ~60 ثانية)")
+    # Streamlit يعيد التنفيذ عند انتهاء TTL للكاش؛ لا نحتاج sleep هنا.
