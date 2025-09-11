@@ -1,240 +1,168 @@
-# -*- coding: utf-8 -*-
-"""
-Core helpers for Funky Brain LIVE
-- normalize_df: يحوّل أي CSV شائع إلى شكل موحّد: [ts, segment, multiplier]
-- compute_probs: يحسب احتمالات الظهور المتوقعة في 10 و 15 رمية
-- board_matrix: يجهّز مصفوفة للعرض اللوحي
-"""
-
+# funkybrain_core.py
+from __future__ import annotations
 import re
-import math
+from typing import Dict, List, Tuple
+import numpy as np
 import pandas as pd
 
-# الخرائط الممكنة لاستخراج الـ segment من صور casinoscores (cloudinary)
-ICON_MAP = {
-    # letters
-    "p": "P", "l": "L", "a": "A", "y": "Y",
-    "f": "F", "u": "U", "n": "N", "k": "K",
-    "t": "T", "i": "I", "m": "M", "e": "E",
-    # specials
-    "1": "1",
-    "bar": "BAR",
-    "disco": "DISCO",
-    "vip": "VIP",
-    "stayin": "STAYINALIVE",  # stayin-alive / stayinalive
-}
-
-ALL_SEGMENTS = [
+SEGMENTS = [
+    "1", "BAR",
     "P","L","A","Y",
     "F","U","N","K",
     "T","I","M","E",
-    "1","BAR","DISCO","VIP","STAYINALIVE"
+    "DISCO","STAYINALIVE","VIP"
 ]
 
-def _guess_segment_from_text(s: str) -> str | None:
-    if not isinstance(s, str):
-        return None
-    s_low = s.lower()
-    # الترتيب مهم: حاول الحالات الخاصة أولاً
-    if "vip" in s_low:
-        return "VIP"
-    if "disco" in s_low:
-        return "DISCO"
-    if "bar" in s_low:
-        return "BAR"
-    if "stay" in s_low or "stayin" in s_low:
-        return "STAYINALIVE"
-    if "number1" in s_low or s_low.strip() in {"1", "one"}:
-        return "1"
-    # حرف منفرد
-    m = re.search(r"/([plafunktime])\.png", s_low)  # من مسار الصور
-    if m:
-        return m.group(1).upper()
-    # حرف مكتوب نصياً مثل LetterK أو K فقط
-    m2 = re.search(r"letter\s*([plafunktime])", s_low)
-    if m2:
-        return m2.group(1).upper()
-    if len(s_low.strip()) == 1 and s_low.strip() in "playfunktime":
-        return s_low.strip().upper()
-    return None
+GROUPS = {
+    "P":"Orange (PLAY)","L":"Orange (PLAY)","A":"Orange (PLAY)","Y":"Orange (PLAY)",
+    "F":"Pink (FUNK)","U":"Pink (FUNK)","N":"Pink (FUNK)","K":"Pink (FUNK)",
+    "T":"Violet (TIME)","I":"Violet (TIME)","M":"Violet (TIME)","E":"Violet (TIME)",
+    "1":"One","BAR":"BAR",
+    "DISCO":"Bonus","STAYINALIVE":"Bonus","VIP":"Bonus"
+}
 
+# خرائط أيقونات casinoscores -> قطاعات
+ICON_MAP = {
+    "1.png":"1",
+    "bar":"BAR",
+    "disco":"DISCO",
+    "vip":"VIP",
+    "stayinalive":"STAYINALIVE",
+    # أحرف
+    "/p.png":"P","/l.png":"L","/a.png":"A","/y.png":"Y",
+    "/f.png":"F","/u.png":"U","/n.png":"N","/k.png":"K",
+    "/t.png":"T","/i.png":"I","/m.png":"M","/e.png":"E",
+}
+
+def _icon_to_segment(s: str) -> str:
+    s = str(s).lower()
+    # جرّب استخراج آخر جزء من مسار funky-time/<key>.png
+    m = re.search(r"funky-time/([a-z0-9_-]+)\.png", s)
+    if m:
+        key = m.group(1)
+        # مفاتيح معروفة بالاسم
+        if key in ("1","bar","vip","disco","stayinalive"):
+            return key.upper() if key != "1" else "1"
+        # أحرف مفردة
+        if len(key) == 1 and key.isalpha():
+            return key.upper()
+    # بحث سريع بالخرائط الثابتة
+    for k,v in ICON_MAP.items():
+        if k in s:
+            return v
+    # إن تعذّر، أرجِع القيمة كما هي (قد تكون حرفًا أصلاً)
+    return s.upper()
 
 def normalize_df(raw: pd.DataFrame) -> pd.DataFrame:
     """
-    يحاول اكتشاف الأعمدة تلقائياً ويُرجع DataFrame بالأعمدة:
-    ts (string/datetime-like), segment (one of ALL_SEGMENTS), multiplier (int)
-    يدعم صيغ casinoscores الشائعة (روابط صور) وصيغنا اليدوية السابقة.
+    يتوقّع أعمدة: ts, segment, multiplier
+    أو: ts, icon/src, multiplier  (من casinoscores الخام)
     """
     df = raw.copy()
 
-    # --------------------------
-    # 1) أعمدة التوقيت
-    # --------------------------
-    ts_col = None
-    for c in df.columns:
-        c_low = str(c).lower()
-        if c_low in {"ts", "time", "datetime", "date", "heure"}:
-            ts_col = c
-            break
-    if ts_col is None:
-        # لو مفيش وقت، اصنع واحداً على التسلسل
-        df["ts"] = range(len(df), 0, -1)
-        ts_col = "ts"
+    # اسماء اعمدة محتملة
+    cols = {c.lower():c for c in df.columns}
+    # الطابع الزمني
+    ts_col = cols.get("ts") or list(df.columns)[0]
+    df.rename(columns={ts_col:"ts"}, inplace=True)
 
-    # --------------------------
-    # 2) أعمدة تحديد الخانة
-    # --------------------------
-    seg_col_candidates = [c for c in df.columns if str(c).lower() in {"segment", "tile", "result", "icon", "img", "image"}]
-    seg_col = seg_col_candidates[0] if seg_col_candidates else None
-
-    if seg_col is None:
-        # لو ما لقيناش، جرّب نقرأ من أول عمود نصّي
+    # المضاعِف
+    mult_col = cols.get("multiplier")
+    if not mult_col:
+        # حاول استنتاجه من نص مثل "25X" أو "1X"
         for c in df.columns:
-            if df[c].dtype == "object":
-                seg_col = c
+            if df[c].astype(str).str.contains(r"\d+\s*[xX]$").any():
+                mult_col = c
                 break
-
-    # استخرج segment
-    def extract_segment(val):
-        # إن كان أصلاً قيمة صالحة
-        if isinstance(val, str):
-            v = val.strip().upper()
-            if v in ALL_SEGMENTS:
-                return v
-        # جرّب من النص/الرابط
-        s = str(val)
-        # Cloudinary path مثل .../funky-time/k.png
-        m = re.search(r"funky[-_]?time/([a-z0-9\-]+)\.png", s.lower())
-        if m:
-            key = m.group(1)
-            # مفاتيح خاصة
-            if key in {"1", "one"}:
-                return "1"
-            if "bar" in key:
-                return "BAR"
-            if "disco" in key and "vip" in key:
-                return "VIP"  # أحياناً vipdisco*
-            if "vip" in key:
-                return "VIP"
-            if "disco" in key:
-                return "DISCO"
-            if "stay" in key:
-                return "STAYINALIVE"
-            if key in ICON_MAP:
-                return ICON_MAP[key].upper()
-        # نصوص مثل LetterK / Number1 / Bar
-        g = _guess_segment_from_text(s)
-        if g:
-            return g
-        return None
-
-    df["segment"] = df[seg_col].apply(extract_segment) if seg_col else None
-
-    # --------------------------
-    # 3) أعمدة المضاعف (multiplier)
-    # --------------------------
-    mult_col = None
-    for c in df.columns:
-        c_low = str(c).lower()
-        if c_low in {"multiplier", "multi", "x", "pay", "payout"}:
-            mult_col = c
-            break
-    if mult_col is None:
-        # حاول استخراجه من نص مثل "25X" أو "x25"
-        maybe_text_col = None
-        for c in df.columns:
-            if df[c].dtype == "object":
-                maybe_text_col = c
-                break
-
-        def extract_mult(val):
-            if pd.isna(val): 
-                return 1
-            s = str(val).upper()
-            m = re.search(r"(\d+)\s*[X×]", s)
-            if m:
-                return int(m.group(1))
-            # أحياناً أرقام نقية
-            m2 = re.search(r"\d+", s)
-            if m2:
-                return int(m2.group(0))
-            return 1
-
-        if maybe_text_col:
-            df["multiplier"] = df[maybe_text_col].apply(extract_mult)
-        else:
-            df["multiplier"] = 1
+    if mult_col:
+        df["multiplier"] = (
+            df[mult_col].astype(str)
+            .str.extract(r"(\d+)")[0]
+            .astype("Int64")
+            .fillna(1)
+            .astype(int)
+        )
     else:
-        # نظّف إلى أرقام
-        def to_int(x):
-            try:
-                s = str(x).upper()
-                s = s.replace("X", "").replace("×", "")
-                return int(float(s))
-            except Exception:
-                return 1
-        df["multiplier"] = df[mult_col].apply(to_int)
+        df["multiplier"] = 1
 
-    # صفّي الصفوف اللي ما قدرناش نحدّد segment لها
-    df = df[df["segment"].isin(ALL_SEGMENTS)].copy()
-    df = df[["ts", "segment", "multiplier"]].reset_index(drop=True)
-    return df
+    # القطاع (segment) أو الأيقونة
+    seg_col = cols.get("segment")
+    if seg_col:
+        df["segment"] = df[seg_col].astype(str).str.upper()
+    else:
+        # ابحث عن عمود رابط الصورة
+        icon_col = None
+        for c in df.columns:
+            if df[c].astype(str).str.contains(r"funky-time/").any():
+                icon_col = c
+                break
+        if icon_col:
+            df["segment"] = df[icon_col].map(_icon_to_segment)
+        else:
+            # لو ما لقينا شيء، اعتبر العمود الثاني هو القطاع
+            fallback = list(df.columns)[1] if len(df.columns) > 1 else "segment"
+            df["segment"] = df[fallback].astype(str).str.upper()
 
+    # حصر القيم ضمن لائحة القطاعات المعتمدة
+    df["segment"] = df["segment"].apply(lambda s: s if s in SEGMENTS else s)
 
-def _prob_ge1_in_n(p: float, n: int) -> float:
-    """احتمال ظهور الخانة مرة واحدة على الأقل خلال n رميات."""
-    try:
-        return 1.0 - (1.0 - p) ** n
-    except Exception:
-        return 0.0
+    # نظّف الطابع الزمني لصيغة واحدة (لا نستعمله حسابيًا هنا)
+    df["ts"] = df["ts"].astype(str)
 
+    # أعمدة نهائية بالترتيب
+    out = df[["ts","segment","multiplier"]].copy()
+    return out
 
-def compute_probs(df: pd.DataFrame, window: int = 100):
+def _probabilities_from_counts(counts: Dict[str,int]) -> Dict[str,float]:
+    total = max(1, sum(counts.values()))
+    return {k: counts.get(k,0)/total for k in SEGMENTS}
+
+def compute_probs(df: pd.DataFrame, window: int) -> Tuple[pd.DataFrame, Dict[str,float], int]:
     """
-    يحسب:
-      - P(next) لكل خانة = تكرارها / مجموع آخر window
-      - Exp in 10, 15
-      - P(≥1 in 10), P(≥1 in 15)
+    يُرجع:
+      tiles_df: DataFrame بكل القطاعات واحتمالاتها
+      eyes: إشارات/ملخّصات سريعة (يمكن عرضها في Eyes Eagle)
+      win: حجم النافذة المستخدم
     """
-    if df.empty:
-        tiles = pd.DataFrame(columns=["Tile","P(next)","Exp in 10","P(≥1 in 10)","Exp in 15","P(≥1 in 15)"])
-        return tiles, pd.DataFrame(), window
+    if len(df) == 0:
+        empty = pd.DataFrame({"Title":SEGMENTS,"Group":[GROUPS.get(s,"") for s in SEGMENTS],
+                              "P(next)":0.0,"Exp in 10":0.0,"P(≥1 in 10)":0.0,
+                              "Exp in 15":0.0,"P(≥1 in 15)":0.0})
+        return empty, {}, window
 
-    # خُذ آخر window صف
-    last = df.tail(window).copy()
-    total = len(last)
+    last = df.tail(window)
+    counts = last["segment"].value_counts().to_dict()
+    p = _probabilities_from_counts(counts)
 
-    counts = last["segment"].value_counts().reindex(ALL_SEGMENTS, fill_value=0)
-    probs = counts / max(total, 1)
+    def p_at_least_once(p_single: float, n: int) -> float:
+        return 1.0 - (1.0 - p_single)**n
 
-    tiles = pd.DataFrame({
-        "Tile": counts.index,
-        "P(next)": probs.values,
-        "Exp in 10": (probs * 10).round(2),
-        "P(≥1 in 10)": probs.apply(lambda p: _prob_ge1_in_n(p, 10)).values,
-        "Exp in 15": (probs * 15).round(2),
-        "P(≥1 in 15)": probs.apply(lambda p: _prob_ge1_in_n(p, 15)).values,
-    })
+    rows = []
+    for s in SEGMENTS:
+        ps = p.get(s, 0.0)
+        rows.append({
+            "Title": s,
+            "Group": GROUPS.get(s, ""),
+            "P(next)": ps,
+            "Exp in 10": ps * 10.0,
+            "P(≥1 in 10)": p_at_least_once(ps, 10),
+            "Exp in 15": ps * 15.0,
+            "P(≥1 in 15)": p_at_least_once(ps, 15),
+        })
+    tiles = pd.DataFrame(rows)
 
-    # ترتيب بسيط: الأكثر احتمالاً أولاً
-    tiles = tiles.sort_values("P(next)", ascending=False).reset_index(drop=True)
-
-    # عيون الصقر البسيطة (إشارات)
-    eyes = pd.DataFrame({
-        "Metric": ["Chance of 50x+", "Chance of 100x+", "If 1 dominates (≥50%)", "Bonus (≥40% chance)"],
-        "Value": [
-            float((last["multiplier"] >= 50).mean()),
-            float((last["multiplier"] >= 100).mean()),
-            float((counts.get("1", 0) / max(total, 1)) >= 0.5),
-            float((probs[["DISCO","VIP","STAYINALIVE","BAR"]].sum()))
-        ]
-    })
-
+    # إشارات مبسطة (عيـن الصقر)
+    # تقدير احتمالات ≥50x في النافذة (تقريب سريع)
+    bonus_mask = last["multiplier"] >= 50
+    p50 = bonus_mask.mean() if len(last) else 0.0
+    eyes = {
+        "p50_in15": 1 - (1 - p50)**15 if p50 > 0 else 0.0,
+        "ones_ratio": (last["segment"] == "1").mean(),
+    }
     return tiles, eyes, window
 
-
-def board_matrix(tiles: pd.DataFrame) -> pd.DataFrame:
-    """
-    يُعيد فقط عمودين لتغذية عرض اللوح.
-    """
-    return tiles[["Tile", "P(≥1 in 10)"]].copy()
+def board_matrix(tiles_df: pd.DataFrame) -> pd.DataFrame:
+    """يُجهّز جدول بسيط للعرض اللوحي مع الترتيب اللوني."""
+    order = SEGMENTS
+    df = tiles_df.set_index("Title").reindex(order).reset_index()
+    return df
