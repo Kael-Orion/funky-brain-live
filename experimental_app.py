@@ -1,4 +1,7 @@
-# app.py — Funky Brain LIVE (Design + Recency/Temperature + Table)
+# app_experimental.py — Funky Brain LIVE (Safe Experimental Build)
+# - لا يلمس app.py القديم
+# - يحتوي: Recency+Softmax + Bonus boost + Table tab + Falcon updates
+# - أي خطأ -> fallback تلقائي
 
 import math
 import pandas as pd
@@ -9,14 +12,14 @@ from datetime import datetime, timedelta
 # ===== محاولات استيراد دوالك الأصلية إن وُجدت (لن نكسر الأساس) =====
 _HAS_CORE = False
 try:
-    from funkybrain_core import normalize_df, compute_probs, board_model
+    from funkybrain_core import normalize_df, compute_probs, board_model  # إن كانت لديك حزمة خاصة
     _HAS_CORE = True
 except Exception:
     _HAS_CORE = False
 
 # ====================== إعدادات عامة ======================
-st.set_page_config(page_title="Funky Brain LIVE", layout="wide")
-st.title("🧠 Funky Brain — LIVE")
+st.set_page_config(page_title="Funky Brain LIVE (Experimental)", layout="wide")
+st.title("🧠 Funky Brain — LIVE (Experimental)")
 
 # ألوان البلاطات
 COLORS = {
@@ -29,24 +32,13 @@ LETTER_GROUP = {
     "F":"PINK","U":"PINK","N":"PINK","K":"PINK","Y2":"PINK",
     "T":"PURPLE","I":"PURPLE","M":"PURPLE","E":"PURPLE",
 }
-GRID_LETTERS = [
-    ["1","BAR"],
-    ["P","L","A","Y"],
-    ["F","U","N","K","Y2"],
-    ["T","I","M","E"],
-    ["DISCO","STAYINALIVE","DISCO_VIP"]
-]
-
 BONUS_SEGMENTS = {"DISCO","STAYINALIVE","DISCO_VIP","BAR"}
 ALL_SEGMENTS = {
-    "1","BAR",
-    "P","L","A","Y","F","U","N","K","Y","T","I","M","E",
-    "DISCO","STAYINALIVE","DISCO_VIP"
+    "1","BAR","P","L","A","Y","F","U","N","K","Y","T","I","M","E","DISCO","STAYINALIVE","DISCO_VIP"
 }
-# ترتيب العرض في الجدول
 ORDER = ["1","BAR","P","L","A","Y","F","U","N","K","Y","T","I","M","E","DISCO","STAYINALIVE","DISCO_VIP"]
 
-# ========== أحجام البلاطات ==========
+# أحجام البلاطات (مصغّرة)
 TILE_H=96; TILE_TXT=38; TILE_SUB=13
 TILE_H_SMALL=84; TILE_TXT_SMALL=32; TILE_SUB_SMALL=12
 TILE_TXT_BONUS=20
@@ -55,6 +47,7 @@ TILE_TXT_BONUS=20
 
 @st.cache_data(show_spinner=False)
 def load_data(file, sheet_url, window):
+    """تحميل بيانات من ملف مرفوع أو Google Sheets (رابط عرض يُحوَّل تلقائيًا لرابط CSV export)."""
     df=None
     if file is not None:
         try:
@@ -79,81 +72,85 @@ def load_data(file, sheet_url, window):
             st.error(f"تعذّر تحميل Google Sheets: {e}")
             return pd.DataFrame(columns=["ts","segment","multiplier"])
 
-    if df is None: return pd.DataFrame(columns=["ts","segment","multiplier"])
+    if df is None:
+        return pd.DataFrame(columns=["ts","segment","multiplier"])
 
+    # التحقق من الأعمدة
     wanted=["ts","segment","multiplier"]
     for c in wanted:
         if c not in df.columns:
             st.error(f"❗ عمود مفقود في الجدول: {c}")
             return pd.DataFrame(columns=wanted)
 
+    # ts -> datetime
     try: df["ts"]=pd.to_datetime(df["ts"])
     except Exception: pass
 
+    # multiplier -> "12X"
     df["multiplier"]=(df["multiplier"].astype(str)
                       .str.extract(r"(\d+)\s*[xX]?",expand=False).fillna("1")
                       .astype(int).astype(str)+"X")
 
+    # قص النافذة
     if len(df)>window: df=df.tail(window).copy()
+
+    # segment -> UPPER
     df["segment"]=df["segment"].astype(str).str.upper()
+
     return df[["ts","segment","multiplier"]].reset_index(drop=True)
 
 
 def recency_softmax_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1.15):
-    dfx=df[~df["segment"].eq("UNKNOWN")].copy()
-    if dfx.empty: dfx=df.copy()
-    segs=list(ALL_SEGMENTS)
-    n=len(dfx)
-    if n==0:
-        vec=np.ones(len(segs),dtype=float)
-    else:
-        ages=np.arange(n,0,-1)
-        half=max(int(decay_half_life),1)
-        w=np.power(0.5,(ages-1)/half); w=w/w.sum()
-        counts={s:0.0 for s in segs}
-        for seg,wt in zip(dfx["segment"],w):
-            if seg in counts: counts[seg]+=wt
-        vec=np.array([counts[s] for s in segs],dtype=float)
-    for i,s in enumerate(segs):
-        if s in BONUS_SEGMENTS: vec[i]*=float(bonus_boost)
-    if vec.sum()<=0: vec[:]=1.0
-    x=vec/(vec.std()+1e-9); x=x/max(float(temperature),1e-6)
-    z=np.exp(x-x.max()); p_next=z/z.sum()
-    probs=dict(zip(segs,p_next))
-    p_in10={s:1.0-(1.0-probs[s])**horizon for s in segs}
-    return probs,p_in10
-
-def fallback_naive(df,horizon=10):
-    counts=df["segment"].value_counts()
-    segs=list(ALL_SEGMENTS)
-    vec=np.array([counts.get(s,0) for s in segs],dtype=float)
-    if vec.sum()==0: vec[:]=1.0
-    z=np.exp((vec-vec.mean())/(vec.std()+1e-6)); p=z/z.sum()
-    probs=dict(zip(segs,p))
-    prob_in10={s:1.0-(1.0-probs[s])**horizon for s in segs}
-    return probs,prob_in10
-
-def get_probs(df,horizon=10,temperature=1.6,decay_half_life=60,bonus_boost=1.15):
-    if _HAS_CORE:
-        try:
-            dfn=normalize_df(df)
-            comp=compute_probs(dfn,horizon=horizon)
-            p_next=comp.get("p_next",{}); p_in10=comp.get("p_in10",{})
-            if len(p_next)==0 or len(p_in10)==0: raise ValueError
-            return p_next,p_in10
-        except Exception:
-            pass
+    """احتمالات مبنية على ترجيح حداثة أسي + Softmax بحرارة + تعزيز بسيط للبونص."""
     try:
-        return recency_softmax_probs(df,horizon,temperature,decay_half_life,bonus_boost)
+        dfx=df[~df["segment"].eq("UNKNOWN")].copy()
+        if dfx.empty: dfx=df.copy()
+        segs=list(ALL_SEGMENTS)
+        n=len(dfx)
+        if n==0:
+            vec=np.ones(len(segs),dtype=float)
+        else:
+            ages=np.arange(n,0,-1)              # الأحدث عمره 1
+            half=max(int(decay_half_life),1)
+            w=np.power(0.5,(ages-1)/half); w=w/w.sum()
+            counts={s:0.0 for s in segs}
+            for seg,wt in zip(dfx["segment"],w):
+                if seg in counts: counts[seg]+=wt
+            vec=np.array([counts[s] for s in segs],dtype=float)
+
+        # تعزيز للبونص
+        for i,s in enumerate(segs):
+            if s in BONUS_SEGMENTS: vec[i]*=float(bonus_boost)
+
+        # softmax
+        if vec.sum()<=0: vec[:]=1.0
+        x=vec/(vec.std()+1e-9)
+        x=x/max(float(temperature),1e-6)
+        z=np.exp(x-x.max()); p_next=z/z.sum()
+
+        probs=dict(zip(segs,p_next))
+        p_in10={s:1.0-(1.0-probs[s])**horizon for s in segs}
+        return probs,p_in10
     except Exception:
-        return fallback_naive(df,horizon=horizon)
+        # fallback بسيط
+        counts=df["segment"].value_counts()
+        segs=list(ALL_SEGMENTS)
+        vec=np.array([counts.get(s,0) for s in segs],dtype=float)
+        if vec.sum()==0: vec[:]=1.0
+        z=np.exp((vec-vec.mean())/(vec.std()+1e-6)); p=z/z.sum()
+        probs=dict(zip(segs,p))
+        p_in10={s:1.0-(1.0-probs[s])**horizon for s in segs}
+        return probs,p_in10
 
 def pct(x): return f"{x*100:.1f}%"
+
+def p_at_least_once(p, n): return 1.0 - (1.0 - float(p))**int(n)
+def exp_count(p, n): return float(n) * float(p)
 
 def letter_color(letter):
     if letter in {"1","ONE"}: return COLORS["ONE"]
     if letter=="BAR": return COLORS["BAR"]
-    if letter in {"P","L","A","Y"}: return COLORS[LETTER_GROUP[letter]]
+    if letter in {"P","L","A","Y"}: return COLORS["ORANGE"]
     if letter in {"F","U","N","K","Y","Y2"}: return COLORS["PINK"]
     if letter in {"T","I","M","E"}: return COLORS["PURPLE"]
     if letter=="STAYINALIVE": return COLORS["STAYINALIVE"]
@@ -182,9 +179,9 @@ with st.sidebar:
     horizon = st.slider("توقع على كم جولة؟", 5, 20, 10, step=1)
     st.write("---")
     st.subheader("🎛️ معلمات التنبؤ (Recency/Softmax)")
-    temperature = st.slider("Temperature (تركيز السوفت-ماكس)", 1.0, 2.5, 1.6, 0.1)
-    decay_half_life = st.slider("Half-life (ترجيح الحداثة)", 20, 120, 60, 5)
-    bonus_boost = st.slider("تعزيز البونص", 1.00, 1.40, 1.15, 0.05)
+    temperature = st.slider("Temperature", 1.0, 2.5, 1.6, 0.1)
+    decay_half_life = st.slider("Half-life", 20, 120, 60, 5)
+    bonus_boost = st.slider("Bonus Boost", 1.00, 1.40, 1.15, 0.05)
     st.write("---")
     st.subheader("📥 مصدر البيانات")
     sheet_url = st.text_input("رابط Google Sheets (مفضّل CSV export)", value="")
@@ -196,14 +193,13 @@ if df.empty:
     st.info("أضف مصدر بيانات صالح يحتوي الأعمدة: ts, segment, multiplier")
     st.stop()
 
-p_next, p_in10 = get_probs(df, horizon=horizon, temperature=temperature,
-                           decay_half_life=decay_half_life, bonus_boost=bonus_boost)
+# حساب الاحتمالات
+p_next, _p_in10 = recency_softmax_probs(
+    df, horizon=horizon, temperature=temperature,
+    decay_half_life=decay_half_life, bonus_boost=bonus_boost
+)
 
-# أدوات رياضيات بسيطة
-def p_at_least_once(p, n): return 1.0 - (1.0 - p)**n
-def exp_count(p, n): return n * p
-
-# تبويبات
+# تبويبات: البلاطات + اللوحة + الجدول + عين الصقر
 tab_tiles, tab_board, tab_table, tab_falcon = st.tabs(
     ["🎛️ Tiles", "🎯 Board + 10 Spins", "📊 Table", "🦅 Falcon Eye"]
 )
@@ -211,7 +207,7 @@ tab_tiles, tab_board, tab_table, tab_falcon = st.tabs(
 # ========== تبويب البلاطات ==========
 with tab_tiles:
     section_header("لوحة البلاطات (ألوان مخصصة)")
-    c1,c2,_,_=st.columns([1.2,1.2,0.1,0.1])
+    c1,c2,_,_ = st.columns([1.2,1.2,0.1,0.1])
     with c1: display_tile("1", f"P(next) {pct(p_next.get('1',0))}", letter_color("1"))
     with c2: display_tile("BAR", f"P(next) {pct(p_next.get('BAR',0))}", letter_color("BAR"), txt_size=34)
 
@@ -271,7 +267,7 @@ with tab_board:
 
 # ========== تبويب الجدول ==========
 with tab_table:
-    section_header("📊 جدول التكهّنات")
+    section_header("📊 جدول التكهّنات (10/15/25 و Exp in 15)")
     rows=[]
     for s in ORDER:
         p=p_next.get(s,0.0)
@@ -285,7 +281,6 @@ with tab_table:
         })
     tdf=pd.DataFrame(rows)
 
-    # تنسيق ألوان و النِّسَب
     def _fmt(v, col):
         return f"{v*100:.1f}%" if col in {"≥1 in 10","≥1 in 15","≥1 in 25"} else (f"{v:.2f}" if col=="Exp in 15" else v)
 
@@ -299,42 +294,42 @@ with tab_table:
 with tab_falcon:
     section_header("عين الصقر — تنبيهات وتحذيرات")
 
-    # احتمالات ظهور أي بونص مرة واحدة على الأقل (10/15/25)
-    p_any_bonus_10 = 1.0
-    p_any_bonus_15 = 1.0
-    p_any_bonus_25 = 1.0
+    # أي بونص ≥1 في 10/15/25 (مبني على p_next الحالية)
+    any10 = 1.0
+    any15 = 1.0
+    any25 = 1.0
     for b in BONUS_SEGMENTS:
-        p = p_next.get(b,0.0)
-        p_any_bonus_10 *= (1.0 - p)**10
-        p_any_bonus_15 *= (1.0 - p)**15
-        p_any_bonus_25 *= (1.0 - p)**25
-    p_any_bonus_10 = 1.0 - p_any_bonus_10
-    p_any_bonus_15 = 1.0 - p_any_bonus_15
-    p_any_bonus_25 = 1.0 - p_any_bonus_25
+        pb = p_next.get(b,0.0)
+        any10 *= (1.0 - pb)**10
+        any15 *= (1.0 - pb)**15
+        any25 *= (1.0 - pb)**25
+    any10 = 1.0 - any10
+    any15 = 1.0 - any15
+    any25 = 1.0 - any25
 
     c0,c1,c2 = st.columns(3)
     with c0:
         st.markdown(
             f"<div style='background:#1565C0;padding:14px;border-radius:14px;font-weight:700;color:white'>"
-            f"🎲 احتمال أي بونص ≥1 في 10: <span style='float:right'>{pct(p_any_bonus_10)}</span></div>",
+            f"🎲 احتمال أي بونص ≥1 في 10: <span style='float:right'>{pct(any10)}</span></div>",
             unsafe_allow_html=True
         )
     with c1:
         st.markdown(
             f"<div style='background:#00897B;padding:14px;border-radius:14px;font-weight:700;color:white'>"
-            f"🎲 احتمال أي بونص ≥1 في 15: <span style='float:right'>{pct(p_any_bonus_15)}</span></div>",
+            f"🎲 احتمال أي بونص ≥1 في 15: <span style='float:right'>{pct(any15)}</span></div>",
             unsafe_allow_html=True
         )
     with c2:
         st.markdown(
             f"<div style='background:#6A1B9A;padding:14px;border-radius:14px;font-weight:700;color:white'>"
-            f"🎲 احتمال أي بونص ≥1 في 25: <span style='float:right'>{pct(p_any_bonus_25)}</span></div>",
+            f"🎲 احتمال أي بونص ≥1 في 25: <span style='float:right'>{pct(any25)}</span></div>",
             unsafe_allow_html=True
         )
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # تقديرات ≥×50 / ≥×100 / أسطوري كما هي (تقريب)
+    # تقديرات ≥×50 / ≥×100 / أسطوري (تقريب)
     bonus10 = {b: (1.0 - (1.0 - p_next.get(b,0.0))**10) for b in BONUS_SEGMENTS}
     p50 = sum(bonus10.values()) * 0.25
     p100 = sum(bonus10.values()) * 0.10
@@ -362,7 +357,7 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # تغيُّر ديناميكي و High Risk كما كان
+    # تغيُّر ديناميكي و High Risk للـ "1"
     Wmini=min(30,len(df))
     if Wmini>=10:
         tail=df.tail(Wmini)
@@ -389,7 +384,6 @@ with tab_falcon:
         f"⚠️ تحذير: سيطرة محتملة للرقم 1 خلال 15 سبِن — P(≥1 خلال 15) = {pct(p1_in15)}</div>",
         unsafe_allow_html=True
     )
-    st.caption("🔧 ملاحظة: عندما تفعّل نماذجك الخاصة سيُستبدل ما سبق بتقديراتك الدقيقة.")
 
 # ========== أسفل الصفحة: معاينة الداتا ==========
 with st.expander("عرض البيانات (آخر نافذة)"):
