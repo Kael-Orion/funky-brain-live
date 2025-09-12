@@ -1,4 +1,4 @@
-# app.py — Funky Brain LIVE (Design Edition)
+# app.py — Funky Brain LIVE (Design + Recency/Temperature)
 
 import math
 import pandas as pd
@@ -31,13 +31,11 @@ COLORS = {
 }
 
 # خرائط القطاعات إلى مجموعات (للتلوين واللوحات)
-# الحروف: P L A Y | F U N K Y | T I M E
 LETTER_GROUP = {
     "P": "ORANGE", "L": "ORANGE", "A": "ORANGE", "Y": "ORANGE",
     "F": "PINK",   "U": "PINK",   "N": "PINK",   "K": "PINK", "Y2":"PINK",
     "T": "PURPLE", "I": "PURPLE", "M": "PURPLE", "E": "PURPLE",
 }
-# كي نميّز الـ Y الأولى ضمن PLAY والـ Y الثانية ضمن FUNKY عند الرسم فقط
 GRID_LETTERS = [
     ["1", "BAR"],
     ["P", "L", "A", "Y"],
@@ -52,6 +50,16 @@ ALL_SEGMENTS = {
     "P","L","A","Y","F","U","N","K","Y","T","I","M","E",
     "DISCO","STAYINALIVE","DISCO_VIP"
 }
+
+# ========== أحجام البلاطات (صغّرناها) ==========
+TILE_H = 96          # كان 110
+TILE_TXT = 38        # كان 42
+TILE_SUB = 13
+TILE_H_SMALL = 84    # كان 90
+TILE_TXT_SMALL = 32
+TILE_SUB_SMALL = 12
+TILE_H_BONUS = 96
+TILE_TXT_BONUS = 20
 
 # ====================== وظائف مساعدة ======================
 
@@ -80,7 +88,6 @@ def load_data(file, sheet_url, window):
     if df is None and sheet_url:
         url = sheet_url.strip()
         if "docs.google.com/spreadsheets" in url and "export?format=csv" not in url:
-            # نحول رابط العرض إلى تصدير CSV
             try:
                 gid = url.split("gid=")[-1]
             except Exception:
@@ -98,7 +105,6 @@ def load_data(file, sheet_url, window):
 
     # نضمن الأعمدة المطلوبة
     wanted = ["ts","segment","multiplier"]
-    # إن كانت لديك صيغة أخرى، حوّلها هنا
     for col in wanted:
         if col not in df.columns:
             st.error(f"❗ عمود مفقود في الجدول: {col}")
@@ -123,36 +129,82 @@ def load_data(file, sheet_url, window):
         df = df.tail(window).copy()
 
     # توحيد الحقول غير المعروفة
-    df["segment"] = df["segment"].astype(str).str.upper().replace({"UNKNOWN":"UNKNOWN"})
+    df["segment"] = df["segment"].astype(str).str.upper()
 
     return df[["ts","segment","multiplier"]].reset_index(drop=True)
 
 
-def naive_probs(df, horizon=10):
+def recency_softmax_probs(
+    df,
+    horizon=10,
+    temperature=1.6,
+    decay_half_life=60,
+    bonus_boost=1.15,
+):
     """
-    بديل آمن إذا لم تتوفر دوالّك: احتمالات نسبية من التكرار الأخير
-    ويُعاد توزيعها بـ softmax بسيطة (للاستقرار).
+    احتمالات مبنية على:
+    - ترجيح حداثة أُسّي Half-life
+    - Softmax بحرارة (Temperature)
+    - تعزيز بسيط لقطاعات البونص
     """
+    # استبعاد UNKNOWN
+    dfx = df[~df["segment"].eq("UNKNOWN")].copy()
+    if dfx.empty:
+        dfx = df.copy()
+
+    segs = list(ALL_SEGMENTS)
+    n = len(dfx)
+
+    # إذا ما فيه بيانات، وزّع متساوي
+    if n == 0:
+        vec = np.ones(len(segs), dtype=float)
+    else:
+        ages = np.arange(n, 0, -1)             # الأحدث عمره 1
+        half = max(int(decay_half_life), 1)
+        w = np.power(0.5, (ages-1)/half)       # وزن أُسّي
+        w = w / w.sum()
+
+        counts = {s: 0.0 for s in segs}
+        for seg, weight in zip(dfx["segment"], w):
+            if seg in counts:
+                counts[seg] += weight
+        vec = np.array([counts[s] for s in segs], dtype=float)
+
+    # تعزيز للبونص
+    for i, s in enumerate(segs):
+        if s in BONUS_SEGMENTS:
+            vec[i] *= float(bonus_boost)
+
+    # softmax بدرجة حرارة
+    if vec.sum() <= 0:
+        vec[:] = 1.0
+    x = vec / (vec.std() + 1e-9)
+    x = x / max(float(temperature), 1e-6)
+    z = np.exp(x - x.max())
+    p_next = z / z.sum()
+
+    probs = dict(zip(segs, p_next))
+    p_in10 = {s: 1.0 - (1.0 - probs[s])**horizon for s in segs}
+    return probs, p_in10
+
+
+def fallback_naive(df, horizon=10):
+    """بديل بسيط إذا لزم الأمر"""
     counts = df["segment"].value_counts()
     segs = list(ALL_SEGMENTS)
     vec = np.array([counts.get(s, 0) for s in segs], dtype=float)
     if vec.sum() == 0:
         vec[:] = 1.0
-    # softmax خفيفة
     z = np.exp((vec - vec.mean()) / (vec.std() + 1e-6))
     p = z / z.sum()
     probs = dict(zip(segs, p))
-    # احتمال الظهور في ≥1 من 10 = 1 - (1 - p)^10 (تقريب مستقل)
     prob_in10 = {s: 1.0 - (1.0 - probs[s])**horizon for s in segs}
     return probs, prob_in10
 
 
-def get_probs(df, horizon=10):
+def get_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1.15):
     """
-    إما من دوالّك الأصلية (إن وُجدت) أو من النايف.
-    يجب أن يُعيد:
-      - p_next: احتمال الظهور في السبِن القادم لكل قطاع
-      - p_in10: احتمال الظهور مرة على الأقل ضمن 10 سبِنات
+    يحاول استخدام دوالك الأصلية، وإلا يستخدم نموذج الترجيح/السوفتماكس.
     """
     if _HAS_CORE:
         try:
@@ -160,10 +212,24 @@ def get_probs(df, horizon=10):
             comp = compute_probs(dfn, horizon=horizon)  # افتراض: يُعيد dict فيه p_next و p_in10
             p_next = comp.get("p_next", {})
             p_in10 = comp.get("p_in10", {})
+            # لو ناقص أو فاضي، نكمّل بالطريقة الجديدة
+            if len(p_next) == 0 or len(p_in10) == 0:
+                raise ValueError("core probs empty -> use recency/softmax")
             return p_next, p_in10
         except Exception:
             pass
-    return naive_probs(df, horizon)
+
+    # طريقتنا المحسّنة
+    try:
+        return recency_softmax_probs(
+            df,
+            horizon=horizon,
+            temperature=temperature,
+            decay_half_life=decay_half_life,
+            bonus_boost=bonus_boost,
+        )
+    except Exception:
+        return fallback_naive(df, horizon=horizon)
 
 
 def pct(x):
@@ -190,7 +256,7 @@ def letter_color(letter):
     return "#444"
 
 
-def display_tile(label, subtext, bg, height=110, radius=18, txt_size=42, sub_size=14):
+def display_tile(label, subtext, bg, height=TILE_H, radius=16, txt_size=TILE_TXT, sub_size=TILE_SUB):
     st.markdown(
         f"""
         <div style="
@@ -220,6 +286,11 @@ with st.sidebar:
     window = st.slider("Window size (spins)", 50, 300, 120, step=10)
     horizon = st.slider("توقع على كم جولة؟", 5, 20, 10, step=1)
     st.write("---")
+    st.subheader("🎛️ معلمات التنبؤ (Recency/Softmax)")
+    temperature = st.slider("Temperature (تركيز السوفت-ماكس)", 1.0, 2.5, 1.6, 0.1)
+    decay_half_life = st.slider("Half-life (ترجيح الحداثة)", 20, 120, 60, 5)
+    bonus_boost = st.slider("تعزيز البونص", 1.00, 1.40, 1.15, 0.05)
+    st.write("---")
     st.subheader("📥 مصدر البيانات")
     sheet_url = st.text_input("رابط Google Sheets (مفضّل CSV export)", value="")
     upload = st.file_uploader("…أو ارفع ملف CSV/Excel", type=["csv","xlsx","xls"])
@@ -230,7 +301,13 @@ if df.empty:
     st.info("أضف مصدر بيانات صالح يحتوي الأعمدة: ts, segment, multiplier")
     st.stop()
 
-p_next, p_in10 = get_probs(df, horizon=horizon)  # dicts
+p_next, p_in10 = get_probs(
+    df,
+    horizon=horizon,
+    temperature=temperature,
+    decay_half_life=decay_half_life,
+    bonus_boost=bonus_boost,
+)
 
 tab_tiles, tab_board, tab_falcon = st.tabs(["🎛️ Tiles", "🎯 Board + 10 Spins", "🦅 Falcon Eye"])
 
@@ -240,9 +317,9 @@ with tab_tiles:
     # الصف العلوي: 1 | BAR
     c1, c2, c3, c4 = st.columns([1.2, 1.2, 0.1, 0.1])
     with c1:
-        display_tile("1", f"P(next) {pct(p_next.get('1', 0))}", letter_color("1"), height=110, txt_size=42)
+        display_tile("1", f"P(next) {pct(p_next.get('1', 0))}", letter_color("1"))
     with c2:
-        display_tile("BAR", f"P(next) {pct(p_next.get('BAR', 0))}", letter_color("BAR"), height=110, txt_size=36)
+        display_tile("BAR", f"P(next) {pct(p_next.get('BAR', 0))}", letter_color("BAR"), txt_size=34)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
@@ -279,7 +356,7 @@ with tab_tiles:
                 "VIP DISCO" if B=="DISCO_VIP" else ("STAYIN'ALIVE" if B=="STAYINALIVE" else "DISCO"),
                 f"P(next) {pct(p_next.get(B, 0))}",
                 letter_color(B),
-                height=120, txt_size=22
+                height=TILE_H, txt_size=TILE_TXT_BONUS
             )
 
 # ========== تبويب اللوحة + توقع 10 ==========
@@ -290,11 +367,12 @@ with tab_board:
     def prob10(seg):
         return pct(p_in10.get(seg, 0))
 
-    # نرتّب اللوحة بطريقة قريبة من الصورة/اللوحة
     # الصف: 1 | BAR
     c1, c2 = st.columns(2)
-    with c1: display_tile("1", f"≥1 in 10: {prob10('1')}", letter_color("1"), height=90)
-    with c2: display_tile("BAR", f"≥1 in 10: {prob10('BAR')}", letter_color("BAR"), height=90)
+    with c1: display_tile("1", f"≥1 in 10: {prob10('1')}", letter_color("1"),
+                           height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
+    with c2: display_tile("BAR", f"≥1 in 10: {prob10('BAR')}", letter_color("BAR"),
+                           height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
@@ -302,7 +380,8 @@ with tab_board:
     cols = st.columns(4)
     for i, L in enumerate(["P","L","A","Y"]):
         with cols[i]:
-            display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L), height=90)
+            display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L),
+                         height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
@@ -310,7 +389,8 @@ with tab_board:
     cols = st.columns(5)
     for i, L in enumerate(["F","U","N","K","Y"]):
         with cols[i]:
-            display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L if L!="Y" else "Y2"), height=90)
+            display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L if L!="Y" else "Y2"),
+                         height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
@@ -318,7 +398,8 @@ with tab_board:
     cols = st.columns(4)
     for i, L in enumerate(["T","I","M","E"]):
         with cols[i]:
-            display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L), height=90)
+            display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L),
+                         height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
@@ -327,18 +408,16 @@ with tab_board:
     for i, B in enumerate(["DISCO","STAYINALIVE","DISCO_VIP"]):
         label = "VIP DISCO" if B=="DISCO_VIP" else ("STAYIN'ALIVE" if B=="STAYINALIVE" else "DISCO")
         with cols[i]:
-            display_tile(label, f"≥1 in 10: {prob10(B)}", letter_color(B), height=96, txt_size=20)
+            display_tile(label, f"≥1 in 10: {prob10(B)}", letter_color(B),
+                         height=TILE_H_SMALL, txt_size=TILE_TXT_BONUS, sub_size=TILE_SUB_SMALL)
 
 # ========== تبويب عين الصقر ==========
 with tab_falcon:
     section_header("عين الصقر — تنبيهات وتحذيرات")
 
-    # مؤشرات مبسطة:
-    # 1) تقدير احتمال ≥×50 و ≥×100 في البونصات خلال 10
-    # (لو عندك model يُرجى استبدال التقديرات أدناه بدالتك)
+    # 1) تقدير مبسّط لاحتمالات البونص
     bonus10 = {b: p_in10.get(b, 0.0) for b in BONUS_SEGMENTS}
-    # تقدير بدائي لاحتمال مضاعفات كبيرة: نعطي وزنًا أعلى للبونصات
-    p50 = sum(bonus10.values()) * 0.25      # تقدير تقريبي
+    p50 = sum(bonus10.values()) * 0.25
     p100 = sum(bonus10.values()) * 0.10
     pLegend = sum(bonus10.values()) * 0.04
 
@@ -364,15 +443,13 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # 2) High/Medium/Low change (إشارة ديناميكية مبسطة من تغيّر توزيع القطاعات)
-    #      نقيس تباعد التوزيع الحالي عن متوسط آخر 3 نوافذ صغيرة
+    # 2) تغيُّر ديناميكي مبسّط
     Wmini = min(30, len(df))
     if Wmini >= 10:
         tail = df.tail(Wmini)
         counts = tail["segment"].value_counts(normalize=True)
         meanp = counts.mean()
         varp = ((counts - meanp)**2).mean()
-        # عتبات تقريبية
         if varp > 0.005:
             change_label = "High change"
             badge = "<span style='color:#D32F2F;font-weight:700'>HIGH</span>"
@@ -396,7 +473,7 @@ with tab_falcon:
 
     # 3) تحذير High Risk: سيطرة “1” في 15 جولة قادمة (بديل مبسط)
     p1_next, p1_in15 = p_next.get("1", 0.0), (1 - (1 - p_next.get("1", 0.0))**15)
-    high_risk = p1_in15 > 0.85  # عتبة تقريبية
+    high_risk = p1_in15 > 0.85
     color = "#D32F2F" if high_risk else "#37474F"
     st.markdown(
         f"<div style='background:{color};color:#fff;padding:14px;border-radius:12px'>"
