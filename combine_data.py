@@ -1,39 +1,55 @@
+# combine_data.py
 import pandas as pd
-import glob
-from pathlib import Path
+import os
 
-# المجلد اللي نحفظ فيه كل الملفات
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = "data"
+OUTPUT_FILE = os.path.join(DATA_DIR, "combined_spins.csv")
 
-# اقرأ كل الملفات داخل data/ اللي تنتهي بـ csv أو xlsx
-files = list(DATA_DIR.glob("spins_cleaned_*.csv")) + list(DATA_DIR.glob("spins_cleaned_*.xlsx"))
+def clean_df(df):
+    # نتأكد أن الأعمدة موجودة
+    needed = ["ts", "segment", "multiplier"]
+    df = df[needed]
 
-all_dfs = []
-for f in files:
-    try:
-        if f.suffix == ".csv":
-            df = pd.read_csv(f)
-        else:  # xlsx
-            df = pd.read_excel(f)
-        all_dfs.append(df)
-        print(f"✅ Loaded {f} with {len(df)} rows")
-    except Exception as e:
-        print(f"⚠️ Failed to read {f}: {e}")
+    # تحويل التاريخ
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
 
-if not all_dfs:
-    print("⚠️ لم أجد أي ملفات في مجلد data/. تأكد أنك حفظت هناك ملفات باسم spins_cleaned_*.csv أو .xlsx")
-else:
-    combined = pd.concat(all_dfs, ignore_index=True)
-    combined.drop_duplicates(inplace=True)
-    combined.sort_values("ts", inplace=True)
-    combined.reset_index(drop=True, inplace=True)
+    # توحيد segment
+    df["segment"] = df["segment"].astype(str).str.strip().str.upper()
 
-    # احفظ النتيجة
-    out_csv = DATA_DIR / "all_spins.csv"
-    out_xlsx = DATA_DIR / "all_spins.xlsx"
+    # إصلاح multiplier
+    df["multiplier"] = (
+        df["multiplier"]
+        .astype(str)
+        .str.extract(r"(\d+)", expand=False)  # نأخذ الرقم فقط
+        .fillna("1")
+        .astype(int)
+    )
+    return df
 
-    combined.to_csv(out_csv, index=False)
-    combined.to_excel(out_xlsx, index=False)
+def main():
+    all_dfs = []
+    for file in os.listdir(DATA_DIR):
+        path = os.path.join(DATA_DIR, file)
+        if file.endswith(".csv"):
+            df = pd.read_csv(path)
+        elif file.endswith(".xlsx"):
+            df = pd.read_excel(path)
+        else:
+            continue
 
-    print(f"🎉 تم إنشاء {out_csv} و {out_xlsx} بعدد {len(combined)} رمية.")
+        if not {"ts", "segment", "multiplier"}.issubset(df.columns):
+            print(f"⚠️ تخطيت {file}: أعمدة ناقصة")
+            continue
+
+        all_dfs.append(clean_df(df))
+
+    if not all_dfs:
+        print("❌ لا يوجد ملفات صالحة للدمج")
+        return
+
+    final_df = pd.concat(all_dfs, ignore_index=True).dropna()
+    final_df.to_csv(OUTPUT_FILE, index=False)
+    print(f"✅ تم حفظ الملف المدموج: {OUTPUT_FILE} ({len(final_df)} صف)")
+
+if __name__ == "__main__":
+    main()
