@@ -1,9 +1,9 @@
-# app.py — Funky Brain LIVE (Stable + ML-ready)
-# - يدعم data/combined_spins.csv + رفع ملف + Google Sheets (CSV export)
-# - نموذج Recency+Softmax مع Bonus boost + سقوط آمن
+# app.py — Funky Brain LIVE (Stable + Experimental features + In-app Combiner)
+# - يقرأ من data/combined_spins.csv أو من رفع ملف / Google Sheets
+# - نموذج Recency+Softmax مع Bonus boost
 # - تبويبات: Tiles / Board + 10 / Table / Falcon Eye
 # - تنبيه عين الصقر: احتمال تكرار "1" ≥ 3 مرات في 10 رميات
-# - ربط اختياري بنموذج متعلم (models/pattern_model.py أو models/pattern_model.pkl)
+# - زر داخل التطبيق لدمج ملفات data/spins_cleaned_*.csv(xlsx) إلى combined_spins.csv
 
 import os
 import math
@@ -12,51 +12,29 @@ import numpy as np
 import streamlit as st
 from datetime import datetime, timedelta
 
-# ========= (1) محاولات استخدام مكتباتك الخاصة (لاتكسر الأساس) =========
+# ===== محاولة استخدام دوالّك الأساسية إن وُجدت (لا نكسر شيء) =====
 _HAS_CORE = False
 try:
-    from funkybrain_core import normalize_df, compute_probs, board_model  # اختياري
+    from funkybrain_core import normalize_df, compute_probs, board_model
     _HAS_CORE = True
 except Exception:
     _HAS_CORE = False
 
-# نموذج متعلم اختياري من مجلد models/
-_HAS_TRAINED = False
-_TRAINED_LOADER = None
-_TRAINED_PREDICT = None
-_TRAINED_PATH_DEFAULT = "models/pattern_model.pkl"
-try:
-    # نحاول استيراد أي واجهة متاحة
-    import models.pattern_model as pm  # أنت أنشأته
-    # دعم عدة احتمالات لأسماء الدوال:
-    if hasattr(pm, "load_model"):
-        _TRAINED_LOADER = pm.load_model
-    elif hasattr(pm, "load_artifacts"):
-        _TRAINED_LOADER = pm.load_artifacts
-    # دالة تنبؤ:
-    if hasattr(pm, "predict_next_probs"):
-        _TRAINED_PREDICT = pm.predict_next_probs
-    elif hasattr(pm, "predict_proba_next"):
-        _TRAINED_PREDICT = pm.predict_proba_next
-    elif hasattr(pm, "predict"):
-        _TRAINED_PREDICT = pm.predict
-    _HAS_TRAINED = _TRAINED_LOADER is not None and _TRAINED_PREDICT is not None
-except Exception:
-    _HAS_TRAINED = False
-    _TRAINED_LOADER = None
-    _TRAINED_PREDICT = None
-
-# ========= (2) إعدادات عامة و ألوان =========
+# ------------------------ إعدادات عامة ------------------------
 st.set_page_config(page_title="Funky Brain LIVE", layout="wide")
 st.title("🧠 Funky Brain — LIVE")
 
-REPO_COMBINED_PATH = "data/combined_spins.csv"
+# مسار ملف البيانات المدموج داخل المستودع
+DATA_DIR = "data"
+REPO_COMBINED_PATH = os.path.join(DATA_DIR, "combined_spins.csv")
 
+# ألوان البلاطات
 COLORS = {
     "ONE": "#F4D36B", "BAR": "#5AA64F",
     "ORANGE": "#E7903C", "PINK": "#C85C8E", "PURPLE": "#9A5BC2",
     "STAYINALIVE": "#4FC3D9", "DISCO": "#314E96", "DISCO_VIP": "#B03232",
 }
+# مجموعات الحروف (للتلوين)
 LETTER_GROUP = {
     "P":"ORANGE","L":"ORANGE","A":"ORANGE","Y":"ORANGE",
     "F":"PINK","U":"PINK","N":"PINK","K":"PINK","Y2":"PINK",
@@ -68,12 +46,12 @@ ALL_SEGMENTS = {
 }
 ORDER = ["1","BAR","P","L","A","Y","F","U","N","K","Y","T","I","M","E","DISCO","STAYINALIVE","DISCO_VIP"]
 
-# أحجام البلاطات
+# أحجام البلاطات (مصغّرة قليلًا)
 TILE_H=96; TILE_TXT=38; TILE_SUB=13
 TILE_H_SMALL=84; TILE_TXT_SMALL=32; TILE_SUB_SMALL=12
 TILE_TXT_BONUS=20
 
-# ========= (3) دوال مساعدة =========
+# ------------------------ وظائف مساعدة ------------------------
 def pct(x: float) -> str:
     try:
         return f"{float(x)*100:.1f}%"
@@ -115,9 +93,79 @@ def section_header(title):
         unsafe_allow_html=True,
     )
 
-# ========= (4) تحميل البيانات (Repo / Upload / Sheets) =========
+# ---------- منظف الصفوف المعياري ----------
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    needed = ["ts", "segment", "multiplier"]
+    df = df.copy()
+    # أعمدة مطلوبة
+    for c in needed:
+        if c not in df.columns:
+            raise ValueError(f"Column missing: {c}")
+    # ts
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    # segment
+    df["segment"] = df["segment"].astype(str).str.strip().str.upper()
+    # multiplier → "12X"
+    df["multiplier"] = (
+        df["multiplier"].astype(str)
+        .str.extract(r"(\d+)\s*[xX]?", expand=False)
+        .fillna("1").astype(int).astype(str) + "X"
+    )
+    # إسقاط الفارغ
+    df = df.dropna(subset=["ts", "segment"]).reset_index(drop=True)
+    # ترتيب
+    df = df.sort_values("ts")
+    return df[needed]
+
+# ---------- مدمج داخلي داخل التطبيق ----------
+def combine_inside_streamlit() -> tuple[int, str]:
+    """
+    يقرأ كل الملفات التي تبدأ بـ spins_cleaned في مجلد data/
+    (CSV أو XLSX/XLS) ويدمجها إلى data/combined_spins.csv
+    يرجع (عدد_الصفوف, رسالة)
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    paths = []
+    for name in os.listdir(DATA_DIR):
+        low = name.lower()
+        if low.startswith("spins_cleaned") and (low.endswith(".csv") or low.endswith(".xlsx") or low.endswith(".xls")):
+            paths.append(os.path.join(DATA_DIR, name))
+    if not paths:
+        return 0, "لم يتم العثور على أي ملفات تبدأ بـ spins_cleaned داخل data/."
+
+    frames = []
+    for p in sorted(paths):
+        try:
+            if p.lower().endswith(".csv"):
+                df = pd.read_csv(p)
+            else:
+                df = pd.read_excel(p)
+            dfc = clean_df(df)
+            frames.append(dfc)
+        except Exception as e:
+            st.warning(f"تجاوز الملف {os.path.basename(p)} بسبب: {e}")
+
+    if not frames:
+        return 0, "لم يتمكن القارئ من تحميل أي ملف صالح."
+
+    big = pd.concat(frames, ignore_index=True)
+
+    # إزالة تكرارات
+    big = big.drop_duplicates(subset=["ts","segment","multiplier"]).sort_values("ts").reset_index(drop=True)
+
+    big.to_csv(REPO_COMBINED_PATH, index=False, encoding="utf-8")
+    return len(big), f"تم الدمج في {REPO_COMBINED_PATH} — إجمالي الصفوف: {len(big):,}"
+
+# ---------- قراءة البيانات (repo / upload / sheets) ----------
 @st.cache_data(show_spinner=False)
 def load_data(file, sheet_url, window, use_repo_file=False, repo_path=REPO_COMBINED_PATH):
+    """
+    يحمّل البيانات من:
+    - ملف المستودع data/combined_spins.csv (إن طُلب وموجود)
+    - ملف مرفوع CSV/Excel
+    - Google Sheets (نحوّل رابط العرض إلى export?format=csv تلقائيًا)
+    ثم يرجع آخر window صفوف مع الأعمدة: ts, segment, multiplier
+    """
     df = None
 
     # (أ) ملف المستودع
@@ -138,7 +186,7 @@ def load_data(file, sheet_url, window, use_repo_file=False, repo_path=REPO_COMBI
             st.error(f"فشل قراءة الملف: {e}")
             return pd.DataFrame(columns=["ts","segment","multiplier"])
 
-    # (ج) Google Sheets (تحويل إلى export CSV)
+    # (ج) Google Sheets -> CSV
     if df is None and sheet_url:
         url = sheet_url.strip()
         if "docs.google.com/spreadsheets" in url and "export?format=csv" not in url:
@@ -157,37 +205,21 @@ def load_data(file, sheet_url, window, use_repo_file=False, repo_path=REPO_COMBI
     if df is None:
         return pd.DataFrame(columns=["ts","segment","multiplier"])
 
-    # التحقق من الأعمدة
-    wanted = ["ts","segment","multiplier"]
-    for c in wanted:
-        if c not in df.columns:
-            st.error(f"❗ عمود مفقود في الجدول: {c}")
-            return pd.DataFrame(columns=wanted)
-
-    # ts -> datetime (إن أمكن)
     try:
-        df["ts"] = pd.to_datetime(df["ts"])
-    except Exception:
-        pass
-
-    # multiplier -> "12X"
-    df["multiplier"] = (
-        df["multiplier"].astype(str)
-        .str.extract(r"(\d+)\s*[xX]?", expand=False)
-        .fillna("1").astype(int).astype(str) + "X"
-    )
+        df = clean_df(df)
+    except Exception as e:
+        st.error(f"تنسيق الجدول غير صالح: {e}")
+        return pd.DataFrame(columns=["ts","segment","multiplier"])
 
     # قص النافذة
     if len(df) > window:
         df = df.tail(window).copy()
 
-    # توحيد الحروف
-    df["segment"] = df["segment"].astype(str).str.upper()
+    return df.reset_index(drop=True)
 
-    return df[["ts","segment","multiplier"]].reset_index(drop=True)
-
-# ========= (5) نموذج الاحتمالات: Recency + Softmax + Bonus boost =========
+# -------- نموذج الاحتمالات: Recency + Softmax + Bonus boost --------
 def recency_softmax_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1.15):
+    """احتمالات مبنية على ترجيح حداثة أُسّي + Softmax بحرارة + تعزيز بسيط للبونص."""
     try:
         dfx = df[~df["segment"].eq("UNKNOWN")].copy()
         if dfx.empty:
@@ -214,7 +246,7 @@ def recency_softmax_probs(df, horizon=10, temperature=1.6, decay_half_life=60, b
             if s in BONUS_SEGMENTS:
                 vec[i] *= float(bonus_boost)
 
-        # softmax
+        # softmax بدرجة حرارة
         if vec.sum() <= 0:
             vec[:] = 1.0
         x = vec / (vec.std() + 1e-9)
@@ -238,50 +270,29 @@ def recency_softmax_probs(df, horizon=10, temperature=1.6, decay_half_life=60, b
         p_in10 = {s: p_at_least_once(probs[s], horizon) for s in segs}
         return probs, p_in10
 
-def get_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1.15,
-              use_trained=False, trained_path=_TRAINED_PATH_DEFAULT):
-    """
-    ترتيب الأفضلية:
-    1) دوالك الأساسية (funkybrain_core) إن نجحت.
-    2) نموذج متعلم من models/ إن طُلب و وُجد.
-    3) Recency+Softmax (سقوط آمن).
-    """
-    # 1) core
+def get_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1.15):
+    """يحاول استخدام دوالّك الأصلية، وإن فشلت يستخدم نموذج الترجيح/السوفتماكس."""
     if _HAS_CORE:
         try:
             dfn = normalize_df(df)
-            comp = compute_probs(dfn, horizon=horizon)  # متوقع dict فيه p_next و p_in10
+            comp = compute_probs(dfn, horizon=horizon)  # متوقع يعيد dict فيه p_next و p_in10
             p_next = comp.get("p_next", {})
             p_in10 = comp.get("p_in10", {})
             if len(p_next) == 0 or len(p_in10) == 0:
-                raise ValueError("Empty core probs -> fallback")
-            return p_next, p_in10, "core"
+                raise ValueError("Empty core probs -> use recency/softmax")
+            return p_next, p_in10
         except Exception:
             pass
 
-    # 2) trained model
-    if use_trained and _HAS_TRAINED:
-        try:
-            model = _TRAINED_LOADER(trained_path)  # قد تكون load_model أو load_artifacts
-            # دالة التنبؤ يجب أن ترجع dict احتمالات القطاعات للّفة القادمة
-            p_next = _TRAINED_PREDICT(model, df.copy())
-            # تأكد أن جميع القطاعات موجودة (املأ الغائب بصفر)
-            for s in ALL_SEGMENTS:
-                p_next.setdefault(s, 0.0)
-            # اشتقاق ≥1 في 10
-            p_in10 = {s: p_at_least_once(p_next[s], horizon) for s in ALL_SEGMENTS}
-            return p_next, p_in10, "trained"
-        except Exception:
-            pass
-
-    # 3) recency/softmax
-    p_next, p_in10 = recency_softmax_probs(
-        df, horizon=horizon, temperature=temperature,
-        decay_half_life=decay_half_life, bonus_boost=bonus_boost
+    return recency_softmax_probs(
+        df,
+        horizon=horizon,
+        temperature=temperature,
+        decay_half_life=decay_half_life,
+        bonus_boost=bonus_boost,
     )
-    return p_next, p_in10, "recency"
 
-# ========= (6) الواجهة =========
+# ------------------------ الواجهة ------------------------
 with st.sidebar:
     st.subheader("⚙️ الإعدادات")
     window = st.slider("Window size (spins)", 50, 300, 120, step=10)
@@ -292,9 +303,23 @@ with st.sidebar:
     decay_half_life = st.slider("Half-life (ترجيح الحداثة)", 20, 120, 60, 5)
     bonus_boost = st.slider("تعزيز البونص", 1.00, 1.40, 1.15, 0.05)
     st.write("---")
-    st.subheader("🤖 نموذج متعلم (اختياري)")
-    use_trained_model = st.toggle("استخدم النموذج المتعلم إن وُجد", value=False, help="سيتم التحميل من models/pattern_model.py أو models/pattern_model.pkl")
-    trained_path = st.text_input("مسار ملف النموذج", value=_TRAINED_PATH_DEFAULT)
+    st.subheader("🧩 إدارة البيانات")
+    # زر الدمج داخل التطبيق
+    if st.button("🔁 دمج ملفات data/spins_cleaned*.csv(xlsx) إلى combined_spins.csv"):
+        rows, msg = combine_inside_streamlit()
+        if rows > 0:
+            st.success(msg)
+            # إعادة تحميل الكاش حتى تظهر البيانات الجديدة
+            load_data.clear()
+            st.experimental_rerun()
+        else:
+            st.warning(msg)
+
+    # تحميل الملف المدموج
+    if os.path.exists(REPO_COMBINED_PATH):
+        with open(REPO_COMBINED_PATH, "rb") as f:
+            st.download_button("⬇️ تنزيل combined_spins.csv", f.read(), file_name="combined_spins.csv", mime="text/csv")
+
     st.write("---")
     st.subheader("📥 مصدر البيانات")
     use_repo_combined = st.toggle("استخدم ملف المستودع data/combined_spins.csv", value=True)
@@ -302,29 +327,29 @@ with st.sidebar:
     upload = st.file_uploader("…أو ارفع ملف CSV/Excel", type=["csv","xlsx","xls"])
 
 # تحميل الداتا
-df = load_data(upload, sheet_url, window, use_repo_file=use_repo_combined, repo_path=REPO_COMBINED_PATH)
+df = load_data(
+    upload, sheet_url, window,
+    use_repo_file=use_repo_combined, repo_path=REPO_COMBINED_PATH
+)
 if df.empty:
     st.info("أضف مصدر بيانات صالح يحتوي الأعمدة: ts, segment, multiplier")
     st.stop()
 
-# حساب الاحتمالات + مصدرها
-p_next, p_in10, src_name = get_probs(
+# حساب الاحتمالات
+p_next, p_in10 = get_probs(
     df,
     horizon=horizon,
     temperature=temperature,
     decay_half_life=decay_half_life,
     bonus_boost=bonus_boost,
-    use_trained=use_trained_model,
-    trained_path=trained_path,
 )
-st.caption(f"Source of probabilities: **{src_name}**")
 
-# تبويبات
+# تبويبات: البلاطات + اللوحة + الجدول + عين الصقر
 tab_tiles, tab_board, tab_table, tab_falcon = st.tabs(
     ["🎛️ Tiles", "🎯 Board + 10 Spins", "📊 Table", "🦅 Falcon Eye"]
 )
 
-# ---------- Tiles ----------
+# ========== تبويب البلاطات ==========
 with tab_tiles:
     section_header("لوحة البلاطات (ألوان مخصصة)")
     c1, c2, _, _ = st.columns([1.2, 1.2, 0.1, 0.1])
@@ -334,22 +359,29 @@ with tab_tiles:
         display_tile("BAR", f"P(next) {pct(p_next.get('BAR', 0))}", letter_color("BAR"), txt_size=34)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(4)
     for i, L in enumerate(["P","L","A","Y"]):
         with cols[i]:
             display_tile(L, f"P(next) {pct(p_next.get(L, 0))}", letter_color(L))
+
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(5)
     for i, L in enumerate(["F","U","N","K","Y2"]):
         key = "Y" if L == "Y2" else L
         with cols[i]:
             display_tile(key, f"P(next) {pct(p_next.get(key, 0))}", letter_color(L))
+
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(4)
     for i, L in enumerate(["T","I","M","E"]):
         with cols[i]:
             display_tile(L, f"P(next) {pct(p_next.get(L, 0))}", letter_color(L))
+
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(3)
     for i, B in enumerate(["DISCO","STAYINALIVE","DISCO_VIP"]):
         with cols[i]:
@@ -360,10 +392,11 @@ with tab_tiles:
                 height=TILE_H, txt_size=TILE_TXT_BONUS
             )
 
-# ---------- Board + 10 ----------
+# ========== تبويب اللوحة + 10 ==========
 with tab_board:
     section_header("لوحة الرهان + توقع الظهور خلال 10 جولات")
     st.caption("النسبة أسفل كل خانة هي احتمال الظهور مرة واحدة على الأقل خلال الجولات العشر القادمة.")
+
     def prob10(seg): return pct(p_at_least_once(p_next.get(seg, 0.0), 10))
 
     c1, c2 = st.columns(2)
@@ -375,24 +408,31 @@ with tab_board:
                      height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(4)
     for i, L in enumerate(["P","L","A","Y"]):
         with cols[i]:
             display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L),
                          height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
+
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(5)
     for i, L in enumerate(["F","U","N","K","Y"]):
         with cols[i]:
             display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L if L!="Y" else "Y2"),
                          height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
+
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(4)
     for i, L in enumerate(["T","I","M","E"]):
         with cols[i]:
             display_tile(L, f"≥1 in 10: {prob10(L)}", letter_color(L),
                          height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
+
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
     cols = st.columns(3)
     for i, B in enumerate(["DISCO","STAYINALIVE","DISCO_VIP"]):
         label = "VIP DISCO" if B=="DISCO_VIP" else ("STAYIN'ALIVE" if B=="STAYINALIVE" else "DISCO")
@@ -400,7 +440,7 @@ with tab_board:
             display_tile(label, f"≥1 in 10: {prob10(B)}", letter_color(B),
                          height=TILE_H_SMALL, txt_size=TILE_TXT_BONUS, sub_size=TILE_SUB_SMALL)
 
-# ---------- Table ----------
+# ========== تبويب الجدول ==========
 with tab_table:
     section_header("📊 جدول التكهّنات (10/15/25 و Exp in 15)")
     rows = []
@@ -427,12 +467,14 @@ with tab_table:
     )
     st.dataframe(styled, use_container_width=True)
 
-# ---------- Falcon Eye ----------
+# ========== تبويب عين الصقر ==========
 with tab_falcon:
     section_header("عين الصقر — تنبيهات وتحذيرات")
 
     # احتمال أي بونص ≥1 خلال 10/15/25
-    any10 = 1.0; any15 = 1.0; any25 = 1.0
+    any10 = 1.0
+    any15 = 1.0
+    any25 = 1.0
     for b in BONUS_SEGMENTS:
         pb = p_next.get(b, 0.0)
         any10 *= (1.0 - pb)**10
@@ -516,44 +558,34 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # تحذير 1: سيطرة محتملة للرقم 1 خلال 15
+    # تحذير سابق: سيطرة محتملة للرقم 1 خلال 15
     p1_next = p_next.get("1", 0.0)
     p1_in15 = p_at_least_once(p1_next, 15)
-    color15 = "#D32F2F" if p1_in15 > 0.85 else "#37474F"
+    high_risk_15 = p1_in15 > 0.85
+    color15 = "#D32F2F" if high_risk_15 else "#37474F"
     st.markdown(
         f"<div style='background:{color15};color:#fff;padding:14px;border-radius:12px'>"
         f"⚠️ تحذير: سيطرة محتملة للرقم 1 خلال 15 سبِن — P(≥1 خلال 15) = {pct(p1_in15)}</div>",
         unsafe_allow_html=True
     )
 
-    # تحذير 2 (الجديد): احتمال تكرار "1" ≥ 3 مرات في 10 رميات (Binomial tail)
+    # NEW: تحذير أحمر إذا احتمال تكرار '1' ≥ 3 مرات في 10 رميات
     def binom_tail_ge_k(n, p, k):
         p = max(0.0, min(1.0, float(p)))
         total = 0.0
-        for r in range(0, k):  # مجموع P[X=0..k-1]
+        for r in range(0, k):  # sum P[X = 0..k-1]
             total += math.comb(n, r) * (p**r) * ((1-p)**(n-r))
         return 1.0 - total
 
     p1_ge3_in10 = binom_tail_ge_k(10, p1_next, 3)
+    color_ge3 = "#B71C1C"  # أحمر داكن دائمًا
     st.markdown(
-        f"<div style='background:#B71C1C;color:#fff;padding:14px;border-radius:12px'>"
+        f"<div style='background:{color_ge3};color:#fff;padding:14px;border-radius:12px'>"
         f"🛑 تنبيه حاد: احتمال أن يتكرر الرقم <b>1</b> ثلاث مرات أو أكثر خلال 10 سبِن = "
         f"<b>{pct(p1_ge3_in10)}</b> — يُنصح بالتوقف المؤقت.</div>",
         unsafe_allow_html=True
     )
 
-# ========= (7) أسفل الصفحة =========
+# ========== أسفل الصفحة ==========
 with st.expander("عرض البيانات (آخر نافذة)"):
     st.dataframe(df.tail(50), use_container_width=True)
-
-with st.expander("تنزيل ملف البيانات المدموج"):
-    if os.path.exists(REPO_COMBINED_PATH):
-        with open(REPO_COMBINED_PATH, "rb") as f:
-            st.download_button(
-                label="Download combined_spins.csv",
-                data=f.read(),
-                file_name="combined_spins.csv",
-                mime="text/csv"
-            )
-    else:
-        st.info("لا يوجد data/combined_spins.csv في المستودع. أنشئه عبر combine_data.py ثم ادفعه (push).")
