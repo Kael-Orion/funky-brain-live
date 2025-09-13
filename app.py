@@ -1,17 +1,19 @@
 # app.py — Funky Brain LIVE (Stable + Experimental features + In-app Combiner)
 # - يقرأ من data/combined_spins.csv أو من رفع ملف / Google Sheets
-# - نموذج Recency+Softmax مع Bonus boost
+# - نموذج Recency+Softmax مع Bonus boost + خيار استخدام نموذج مُتعلَّم (pickled)
 # - تبويبات: Tiles / Board + 10 / Table / Falcon Eye
 # - تنبيه عين الصقر: احتمال تكرار "1" ≥ 3 مرات في 10 رميات
 # - زر داخل التطبيق لدمج ملفات data/spins_cleaned_*.csv(xlsx) إلى combined_spins.csv
-# - (NEW) سقف نافذة البيانات 5000 / إعادة Y برتقالي تحت A / تلوين صف الجدول كاملًا بلون القطاع
+# - سقف النافذة حتى 5000 سبِن
+# - تصحيح تكرار حرف Y (يظهر مرة واحدة فقط في البلاطات/اللوحة)
 
 import os
 import math
+import pickle
 import pandas as pd
 import numpy as np
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ===== محاولة استخدام دوالّك الأساسية إن وُجدت (لا نكسر شيء) =====
 _HAS_CORE = False
@@ -35,17 +37,18 @@ COLORS = {
     "ORANGE": "#E7903C", "PINK": "#C85C8E", "PURPLE": "#9A5BC2",
     "STAYINALIVE": "#4FC3D9", "DISCO": "#314E96", "DISCO_VIP": "#B03232",
 }
+
 # مجموعات الحروف (للتلوين)
 LETTER_GROUP = {
     "P":"ORANGE","L":"ORANGE","A":"ORANGE","Y":"ORANGE",
     "F":"PINK","U":"PINK","N":"PINK","K":"PINK",
     "T":"PURPLE","I":"PURPLE","M":"PURPLE","E":"PURPLE",
 }
+
 BONUS_SEGMENTS = {"DISCO","STAYINALIVE","DISCO_VIP","BAR"}
 ALL_SEGMENTS = {
     "1","BAR","P","L","A","Y","F","U","N","K","T","I","M","E","DISCO","STAYINALIVE","DISCO_VIP"
 }
-# ترتيب العرض (مهم للجدول واللوحات)
 ORDER = ["1","BAR","P","L","A","Y","F","U","N","K","T","I","M","E","DISCO","STAYINALIVE","DISCO_VIP"]
 
 # أحجام البلاطات
@@ -97,24 +100,95 @@ def section_header(title):
 
 # ---------- منظف الصفوف المعياري ----------
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    needed = ["ts", "segment", "multiplier"]
+    """
+    ينتظر أعمدة: ts, segment, multiplier
+    - ts: أي تمثيل زمني (نحوّل لتاريخ)
+    - segment: اسم القطاع (أو نستخرجه من رابط/نص إن لزم)
+    - multiplier: قيمة على شكل '12X' ... إلخ
+    """
     df = df.copy()
-    for c in needed:
-        if c not in df.columns:
-            raise ValueError(f"Column missing: {c}")
-    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
-    df["segment"] = df["segment"].astype(str).strip().str.upper()
-    df["multiplier"] = (
-        df["multiplier"].astype(str)
+
+    # توحيد أسماء أعمدة شائعة من المصادر الخام
+    cols_lower = {c.lower(): c for c in df.columns}
+    # محاولة تلقائية لتحديد الأعمدة
+    guess_ts = None
+    for k in ["ts","time","timestamp","date","datetime"]:
+        if k in cols_lower: guess_ts = cols_lower[k]; break
+    guess_seg = None
+    for k in ["segment","result","tile","symbol","letter","outcome"]:
+        if k in cols_lower: guess_seg = cols_lower[k]; break
+    guess_mul = None
+    for k in ["multiplier","multi","x","payout","winmult","factor"]:
+        if k in cols_lower: guess_mul = cols_lower[k]; break
+
+    if guess_ts is None:
+        raise ValueError("Column missing: ts")
+    if guess_seg is None:
+        # محاولة استخراج من أعمدة نصية تحوي روابط صور png فيها الاسم
+        # نجمع كل الأعمدة النصية ونتحرى أول قيمة فيها /{name}.png
+        for c in df.columns:
+            if df[c].dtype == object:
+                m = df[c].astype(str).str.extract(r"/([A-Za-z0-9_]+)\.png", expand=False)
+                if m.notna().any():
+                    df["segment"] = m.str.upper().str.replace("DISCOVIP","DISCO_VIP").str.replace("VIPDISCO","DISCO_VIP")
+                    guess_seg = "segment"
+                    break
+        if guess_seg is None:
+            raise ValueError("Column missing: segment")
+
+    if guess_mul is None:
+        # نستخرج من أي عمود أرقام متبوعة بـx
+        for c in df.columns:
+            if df[c].dtype == object:
+                m = df[c].astype(str).str.extract(r"(\d+)\s*[xX]", expand=False)
+                if m.notna().any():
+                    df["multiplier"] = m.fillna("1")
+                    guess_mul = "multiplier"
+                    break
+        if guess_mul is None:
+            raise ValueError("Column missing: multiplier")
+
+    # ts
+    df["ts"] = pd.to_datetime(df[guess_ts], errors="coerce")
+
+    # segment
+    seg = df[guess_seg].astype(str).str.strip().str.upper()
+    seg = seg.replace({
+        "1":"1","ONE":"1","BAR":"BAR",
+        "VIP DISCO":"DISCO_VIP","DISCO VIP":"DISCO_VIP","DISCOVIP":"DISCO_VIP",
+        "STAYIN'ALIVE":"STAYINALIVE","STAYIN_ALIVE":"STAYINALIVE","STAYIN-ALIVE":"STAYINALIVE",
+    })
+    # حروف مفردة من روابط/نصوص قد تأتي مختلطة
+    seg = seg.str.replace(r"[^A-Z0-9_]", "", regex=True)
+
+    # multiplier -> "12X"
+    mul = (
+        df[guess_mul].astype(str)
         .str.extract(r"(\d+)\s*[xX]?", expand=False)
         .fillna("1").astype(int).astype(str) + "X"
     )
-    df = df.dropna(subset=["ts", "segment"]).reset_index(drop=True)
+
+    df = pd.DataFrame({"ts": df["ts"], "segment": seg, "multiplier": mul})
+    df = df.dropna(subset=["ts"]).reset_index(drop=True)
+
+    # إسقاط أي قطاع غير معروف لكن مع 1X -> غالبًا هي "1"
+    is_unknown = ~df["segment"].isin(list(ALL_SEGMENTS))
+    df.loc[is_unknown & df["multiplier"].eq("1X"), "segment"] = "1"
+
+    # قطاعات خارج اللائحة -> UNKNOWN (نتركها، النموذج يستثنيها في الترجيح)
+    df.loc[~df["segment"].isin(list(ALL_SEGMENTS)), "segment"] = "UNKNOWN"
+
+    # ترتيب زمني
     df = df.sort_values("ts")
-    return df[needed]
+    return df[["ts","segment","multiplier"]]
 
 # ---------- مدمج داخلي داخل التطبيق ----------
 def combine_inside_streamlit() -> tuple[int, str]:
+    """
+    يقرأ كل الملفات التي تبدأ بـ spins_cleaned في مجلد data/
+    (CSV أو XLSX/XLS) ويدمجها إلى data/combined_spins.csv
+    يرجع (عدد_الصفوف, رسالة)
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     paths = []
     for name in os.listdir(DATA_DIR):
@@ -123,6 +197,7 @@ def combine_inside_streamlit() -> tuple[int, str]:
             paths.append(os.path.join(DATA_DIR, name))
     if not paths:
         return 0, "لم يتم العثور على أي ملفات تبدأ بـ spins_cleaned داخل data/."
+
     frames = []
     for p in sorted(paths):
         try:
@@ -134,23 +209,35 @@ def combine_inside_streamlit() -> tuple[int, str]:
             frames.append(dfc)
         except Exception as e:
             st.warning(f"تجاوز الملف {os.path.basename(p)} بسبب: {e}")
+
     if not frames:
         return 0, "لم يتمكن القارئ من تحميل أي ملف صالح."
+
     big = pd.concat(frames, ignore_index=True)
     big = big.drop_duplicates(subset=["ts","segment","multiplier"]).sort_values("ts").reset_index(drop=True)
+
     big.to_csv(REPO_COMBINED_PATH, index=False, encoding="utf-8")
     return len(big), f"تم الدمج في {REPO_COMBINED_PATH} — إجمالي الصفوف: {len(big):,}"
 
 # ---------- قراءة البيانات (repo / upload / sheets) ----------
 @st.cache_data(show_spinner=False)
 def load_data(file, sheet_url, window, use_repo_file=False, repo_path=REPO_COMBINED_PATH):
+    """
+    يحمّل البيانات من:
+    - ملف المستودع data/combined_spins.csv (إن طُلب وموجود)
+    - ملف مرفوع CSV/Excel
+    - Google Sheets (نحوّل رابط العرض إلى export?format=csv تلقائيًا)
+    ثم يرجع آخر window صفوف مع الأعمدة: ts, segment, multiplier
+    """
     df = None
+
     # (أ) ملف المستودع
     if use_repo_file and os.path.exists(repo_path):
         try:
             df = pd.read_csv(repo_path)
         except Exception as e:
             st.warning(f"تعذر قراءة {repo_path}: {e}")
+
     # (ب) ملف مرفوع
     if df is None and file is not None:
         try:
@@ -161,6 +248,7 @@ def load_data(file, sheet_url, window, use_repo_file=False, repo_path=REPO_COMBI
         except Exception as e:
             st.error(f"فشل قراءة الملف: {e}")
             return pd.DataFrame(columns=["ts","segment","multiplier"])
+
     # (ج) Google Sheets -> CSV
     if df is None and sheet_url:
         url = sheet_url.strip()
@@ -176,50 +264,64 @@ def load_data(file, sheet_url, window, use_repo_file=False, repo_path=REPO_COMBI
         except Exception as e:
             st.error(f"تعذّر تحميل Google Sheets: {e}")
             return pd.DataFrame(columns=["ts","segment","multiplier"])
+
     if df is None:
         return pd.DataFrame(columns=["ts","segment","multiplier"])
+
     try:
         df = clean_df(df)
     except Exception as e:
         st.error(f"تنسيق الجدول غير صالح: {e}")
         return pd.DataFrame(columns=["ts","segment","multiplier"])
+
+    # قص النافذة
     if len(df) > window:
         df = df.tail(window).copy()
+
     return df.reset_index(drop=True)
 
 # -------- نموذج الاحتمالات: Recency + Softmax + Bonus boost --------
 def recency_softmax_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1.15):
+    """احتمالات مبنية على ترجيح حداثة أُسّي + Softmax بحرارة + تعزيز بسيط للبونص."""
     try:
         dfx = df[~df["segment"].eq("UNKNOWN")].copy()
         if dfx.empty:
             dfx = df.copy()
         segs = list(ALL_SEGMENTS)
         n = len(dfx)
+
         if n == 0:
             vec = np.ones(len(segs), dtype=float)
         else:
-            ages = np.arange(n, 0, -1)
+            ages = np.arange(n, 0, -1)               # الأحدث عمره 1
             half = max(int(decay_half_life), 1)
-            w = np.power(0.5, (ages-1)/half)
+            w = np.power(0.5, (ages-1)/half)         # وزن أسي
             w = w / w.sum()
+
             counts = {s: 0.0 for s in segs}
             for seg, wt in zip(dfx["segment"], w):
                 if seg in counts:
                     counts[seg] += wt
             vec = np.array([counts[s] for s in segs], dtype=float)
+
+        # تعزيز للبونص
         for i, s in enumerate(segs):
             if s in BONUS_SEGMENTS:
                 vec[i] *= float(bonus_boost)
+
+        # softmax بدرجة حرارة
         if vec.sum() <= 0:
             vec[:] = 1.0
         x = vec / (vec.std() + 1e-9)
         x = x / max(float(temperature), 1e-6)
         z = np.exp(x - x.max())
         p_next = z / z.sum()
+
         probs = dict(zip(segs, p_next))
         p_in10 = {s: p_at_least_once(probs[s], horizon) for s in segs}
         return probs, p_in10
     except Exception:
+        # Fallback بسيط (تكرارات)
         counts = df["segment"].value_counts()
         segs = list(ALL_SEGMENTS)
         vec = np.array([counts.get(s, 0) for s in segs], dtype=float)
@@ -232,10 +334,11 @@ def recency_softmax_probs(df, horizon=10, temperature=1.6, decay_half_life=60, b
         return probs, p_in10
 
 def get_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1.15):
+    """يحاول استخدام دوالّك الأصلية، وإن فشلت يستخدم نموذج الترجيح/السوفتماكس."""
     if _HAS_CORE:
         try:
             dfn = normalize_df(df)
-            comp = compute_probs(dfn, horizon=horizon)
+            comp = compute_probs(dfn, horizon=horizon)  # متوقع يعيد dict فيه p_next و p_in10
             p_next = comp.get("p_next", {})
             p_in10 = comp.get("p_in10", {})
             if len(p_next) == 0 or len(p_in10) == 0:
@@ -243,6 +346,7 @@ def get_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1
             return p_next, p_in10
         except Exception:
             pass
+
     return recency_softmax_probs(
         df,
         horizon=horizon,
@@ -251,10 +355,9 @@ def get_probs(df, horizon=10, temperature=1.6, decay_half_life=60, bonus_boost=1
         bonus_boost=bonus_boost,
     )
 
-# ------------------------ الواجهة ------------------------
+# ------------------------ الشريط الجانبي ------------------------
 with st.sidebar:
     st.subheader("⚙️ الإعدادات")
-    # (NEW) رفع السقف إلى 5000
     window = st.slider("Window size (spins)", 50, 5000, 120, step=10)
     horizon = st.slider("توقع على كم جولة؟", 5, 20, 10, step=1)
     st.write("---")
@@ -263,6 +366,7 @@ with st.sidebar:
     decay_half_life = st.slider("Half-life (ترجيح الحداثة)", 20, 120, 60, 5)
     bonus_boost = st.slider("تعزيز البونص", 1.00, 1.40, 1.15, 0.05)
     st.write("---")
+
     st.subheader("🧩 إدارة البيانات")
     if st.button("🔁 دمج ملفات data/spins_cleaned*.csv(xlsx) إلى combined_spins.csv"):
         rows, msg = combine_inside_streamlit()
@@ -272,9 +376,11 @@ with st.sidebar:
             st.experimental_rerun()
         else:
             st.warning(msg)
+
     if os.path.exists(REPO_COMBINED_PATH):
         with open(REPO_COMBINED_PATH, "rb") as f:
             st.download_button("⬇️ تنزيل combined_spins.csv", f.read(), file_name="combined_spins.csv", mime="text/csv")
+
     st.write("---")
     st.subheader("📥 مصدر البيانات")
     use_repo_combined = st.toggle("استخدم ملف المستودع data/combined_spins.csv", value=True)
@@ -290,16 +396,48 @@ if df.empty:
     st.info("أضف مصدر بيانات صالح يحتوي الأعمدة: ts, segment, multiplier")
     st.stop()
 
-# حساب الاحتمالات
-p_next, p_in10 = get_probs(
-    df,
-    horizon=horizon,
-    temperature=temperature,
-    decay_half_life=decay_half_life,
-    bonus_boost=bonus_boost,
-)
+# ------------------------ نموذج مُتعلّم (اختياري) ------------------------
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("🤖 نموذج متعلّم (اختياري)")
+    use_learned = st.toggle("استخدم النموذج المتعلَّم إن وُجد", value=False)
+    model_path_to_use = st.text_input("مسار ملف النموذج", value="models/pattern_model.pkl", key="use_model_path")
 
-# تبويبات
+    model_meta = None
+    learned_pnext = None
+    if use_learned:
+        try:
+            with open(model_path_to_use, "rb") as f:
+                model_obj = pickle.load(f)
+            learned_pnext = model_obj.get("p_next", None)
+            model_meta = model_obj.get("meta", {})
+            if not isinstance(learned_pnext, dict) or len(learned_pnext) == 0:
+                st.error("النموذج المُحمّل لا يحتوي p_next صالح.")
+                learned_pnext = None
+        except Exception as e:
+            st.error(f"تعذّر تحميل النموذج: {e}")
+            learned_pnext = None
+
+        if model_meta:
+            with st.expander("إعدادات النموذج (meta)"):
+                st.json(model_meta)
+
+# حساب الاحتمالات: من النموذج المتعلّم أو Recency/Softmax
+if use_learned and learned_pnext:
+    p_next = {s: float(learned_pnext.get(s, 0.0)) for s in ALL_SEGMENTS}
+    p_in10 = {s: p_at_least_once(p_next[s], horizon) for s in ALL_SEGMENTS}
+    st.success("Source of probabilities: learned model")
+else:
+    p_next, p_in10 = get_probs(
+        df,
+        horizon=horizon,
+        temperature=temperature,
+        decay_half_life=decay_half_life,
+        bonus_boost=bonus_boost,
+    )
+    st.caption("Source of probabilities: recency")
+
+# تبويبات: البلاطات + اللوحة + الجدول + عين الصقر
 tab_tiles, tab_board, tab_table, tab_falcon = st.tabs(
     ["🎛️ Tiles", "🎯 Board + 10 Spins", "📊 Table", "🦅 Falcon Eye"]
 )
@@ -307,8 +445,6 @@ tab_tiles, tab_board, tab_table, tab_falcon = st.tabs(
 # ========== تبويب البلاطات ==========
 with tab_tiles:
     section_header("لوحة البلاطات (ألوان مخصصة)")
-
-    # الصف العلوي: 1 + BAR
     c1, c2, _, _ = st.columns([1.2, 1.2, 0.1, 0.1])
     with c1:
         display_tile("1", f"P(next) {pct(p_next.get('1', 0))}", letter_color("1"))
@@ -317,7 +453,7 @@ with tab_tiles:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # صف ORANGE: P L A Y (وتحت A يعود Y برتقالي)
+    # PLAY (يتضمن Y برتقالي)
     cols = st.columns(4)
     for i, L in enumerate(["P","L","A","Y"]):
         with cols[i]:
@@ -325,7 +461,7 @@ with tab_tiles:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # صف PINK بدون Y: F U N K
+    # FUNK (بدون تكرار Y)
     cols = st.columns(4)
     for i, L in enumerate(["F","U","N","K"]):
         with cols[i]:
@@ -333,7 +469,7 @@ with tab_tiles:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # صف PURPLE: T I M E
+    # TIME
     cols = st.columns(4)
     for i, L in enumerate(["T","I","M","E"]):
         with cols[i]:
@@ -341,7 +477,6 @@ with tab_tiles:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # البونص
     cols = st.columns(3)
     for i, B in enumerate(["DISCO","STAYINALIVE","DISCO_VIP"]):
         with cols[i]:
@@ -369,7 +504,7 @@ with tab_board:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # ORANGE: P L A Y
+    # PLAY (مع Y برتقالي)
     cols = st.columns(4)
     for i, L in enumerate(["P","L","A","Y"]):
         with cols[i]:
@@ -378,7 +513,7 @@ with tab_board:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # PINK: F U N K
+    # FUNK
     cols = st.columns(4)
     for i, L in enumerate(["F","U","N","K"]):
         with cols[i]:
@@ -387,7 +522,7 @@ with tab_board:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # PURPLE: T I M E
+    # TIME
     cols = st.columns(4)
     for i, L in enumerate(["T","I","M","E"]):
         with cols[i]:
@@ -396,7 +531,6 @@ with tab_board:
 
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-    # Bonuses
     cols = st.columns(3)
     for i, B in enumerate(["DISCO","STAYINALIVE","DISCO_VIP"]):
         label = "VIP DISCO" if B=="DISCO_VIP" else ("STAYIN'ALIVE" if B=="STAYINALIVE" else "DISCO")
@@ -411,33 +545,24 @@ with tab_table:
     for s in ORDER:
         p = p_next.get(s, 0.0)
         rows.append({
-            "Segment": "VIP DISCO" if s=="DISCO_VIP" else s,
+            "Segment": "VIP DISCO" if s=="DISCO_VIP" else ("STAYIN'ALIVE" if s=="STAYINALIVE" else s),
             "≥1 in 10": p_at_least_once(p, 10),
             "≥1 in 15": p_at_least_once(p, 15),
             "≥1 in 25": p_at_least_once(p, 25),
             "Exp in 15": exp_count(p, 15),
-            "_color": letter_color(s),
+            "_color": letter_color("1" if s=="1" else s),
         })
     tdf = pd.DataFrame(rows)
 
     def _fmt(v, col):
-        if col in {"≥1 in 10","≥1 in 15","≥1 in 25"}:
-            return f"{v*100:.1f}%"
-        elif col=="Exp in 15":
-            return f"{v:.2f}"
-        return v
+        return f"{v*100:.1f}%" if col in {"≥1 in 10","≥1 in 15","≥1 in 25"} else (f"{v:.2f}" if col=="Exp in 15" else v)
 
-    # (NEW) تلوين الصف بالكامل بلون القطاع
-    def color_row(r):
-        c = r["_color"]
-        style = [f"background-color: {c}; color: white; font-weight:700"] * (len(r)-1)  # بدون _color
-        return style
-
+    # تلوين عمود Segment بلون القطاع
     styled = (
         tdf.drop(columns=["_color"])
            .style.format({c: (lambda v, c=c: _fmt(v, c)) for c in ["≥1 in 10","≥1 in 15","≥1 in 25","Exp in 15"]})
            .apply(lambda s: [f"background-color: {tdf.loc[i,'_color']}; color: white; font-weight:700"
-                             for i in range(len(s))], axis=0, subset=pd.IndexSlice[:, :])
+                             if s.name=="Segment" else "" for i in range(len(s))], axis=0)
     )
     st.dataframe(styled, use_container_width=True)
 
@@ -445,6 +570,7 @@ with tab_table:
 with tab_falcon:
     section_header("عين الصقر — تنبيهات وتحذيرات")
 
+    # احتمال أي بونص ≥1 خلال 10/15/25
     any10 = 1.0
     any15 = 1.0
     any25 = 1.0
@@ -479,6 +605,7 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
+    # تقديرات ≥×50 / ≥×100 / أسطوري (تقريب)
     bonus10 = {b: p_at_least_once(p_next.get(b,0.0), 10) for b in BONUS_SEGMENTS}
     p50 = sum(bonus10.values()) * 0.25
     p100 = sum(bonus10.values()) * 0.10
@@ -506,6 +633,7 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
+    # تغيُّر ديناميكي
     Wmini = min(30, len(df))
     if Wmini >= 10:
         tail = df.tail(Wmini)
@@ -529,6 +657,7 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
+    # تحذير سابق: سيطرة محتملة للرقم 1 خلال 15
     p1_next = p_next.get("1", 0.0)
     p1_in15 = p_at_least_once(p1_next, 15)
     high_risk_15 = p1_in15 > 0.85
@@ -539,10 +668,11 @@ with tab_falcon:
         unsafe_allow_html=True
     )
 
+    # NEW: تحذير أحمر إذا احتمال تكرار '1' ≥ 3 مرات في 10 رميات
     def binom_tail_ge_k(n, p, k):
         p = max(0.0, min(1.0, float(p)))
         total = 0.0
-        for r in range(0, k):
+        for r in range(0, k):  # sum P[X = 0..k-1]
             total += math.comb(n, r) * (p**r) * ((1-p)**(n-r))
         return 1.0 - total
 
@@ -560,20 +690,24 @@ with st.expander("عرض البيانات (آخر نافذة)"):
     st.dataframe(df.tail(50), use_container_width=True)
 
 # ---------- تدريب النموذج من داخل التطبيق (يستخدم الداتا المحمّلة df) ----------
-import pickle
-
 st.sidebar.markdown("---")
 st.sidebar.subheader("🤖 تدريب النموذج (اختياري)")
 
-model_path_input = st.sidebar.text_input("مسار حفظ النموذج", value="models/pattern_model.pkl")
+# مكان الحفظ الافتراضي
+model_path_input = st.sidebar.text_input("مسار حفظ النموذج", value="models/pattern_model.pkl", key="train_model_path")
 
+# عرض لمحة سريعة عن الداتا الحالية
 with st.sidebar.expander("ملخص الداتا المستخدمة في التدريب"):
     st.write(f"عدد الرميات في النافذة الحالية: **{len(df)}**")
     st.write("أعمدة:", list(df.columns))
     st.dataframe(df.tail(10), use_container_width=True)
 
 def train_and_save_model(df, path, horizon, temperature, decay_half_life, bonus_boost):
-    p_next_model, _ = recency_softmax_probs(
+    """
+    ندرب نموذج بسيط: نحسب p_next باستعمال ترجيح الحداثة + سوفتماكس (نفس منطق التكهّن الحي)،
+    ثم نخزن القاموس (p_next + meta) في ملف .pkl ليستعمله التطبيق لاحقًا كمصدر ثابت.
+    """
+    p_next_tr, _ = recency_softmax_probs(
         df,
         horizon=horizon,
         temperature=temperature,
@@ -582,7 +716,7 @@ def train_and_save_model(df, path, horizon, temperature, decay_half_life, bonus_
     )
     model = {
         "type": "recency_softmax",
-        "p_next": p_next_model,
+        "p_next": p_next_tr,
         "meta": {
             "horizon": horizon,
             "temperature": temperature,
@@ -592,7 +726,7 @@ def train_and_save_model(df, path, horizon, temperature, decay_half_life, bonus_
             "trained_at": datetime.utcnow().isoformat() + "Z",
         },
     }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump(model, f)
     return model
@@ -615,7 +749,7 @@ if st.sidebar.button("💾 درِّب النموذج الآن", use_container_wi
                 st.sidebar.download_button(
                     label="⬇️ تحميل النموذج",
                     data=fh.read(),
-                    file_name="pattern_model.pkl",
+                    file_name=os.path.basename(model_path_input) or "pattern_model.pkl",
                     mime="application/octet-stream",
                     use_container_width=True,
                 )
@@ -623,4 +757,4 @@ if st.sidebar.button("💾 درِّب النموذج الآن", use_container_wi
             st.sidebar.error(f"فشل التدريب: {e}")
 
 st.sidebar.markdown("---")
-st.sidebar.caption("نصيحة: بعد تحميل pattern_model.pkl ارفعه إلى مجلد models/ في GitHub ليبقى دائمًا.")
+st.sidebar.caption("نصيحة: بعد تحميل ملف النموذج ارفعه إلى مجلد models/ في GitHub ليبقى دائمًا.")
