@@ -589,3 +589,77 @@ with tab_falcon:
 # ========== أسفل الصفحة ==========
 with st.expander("عرض البيانات (آخر نافذة)"):
     st.dataframe(df.tail(50), use_container_width=True)
+# ---------- تدريب النموذج من داخل التطبيق (يستخدم الداتا المحمّلة df) ----------
+import pickle, os
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🤖 تدريب النموذج (اختياري)")
+
+# مكان الحفظ الافتراضي
+model_path_input = st.sidebar.text_input("مسار حفظ النموذج", value="models/pattern_model.pkl")
+
+# عرض لمحة سريعة عن الداتا الحالية
+with st.sidebar.expander("ملخص الداتا المستخدمة في التدريب"):
+    st.write(f"عدد الرميات في النافذة الحالية: **{len(df)}**")
+    st.write("أعمدة:", list(df.columns))
+    st.dataframe(df.tail(10), use_container_width=True)
+
+def train_and_save_model(df, path, horizon, temperature, decay_half_life, bonus_boost):
+    """
+    ندرب نموذج بسيط: نحسب p_next باستعمال ترجيح الحداثة + سوفتماكس (نفس منطق التكهّن الحي)،
+    ثم نخزن القاموس (p_next + meta) في ملف .pkl ليستعمله التطبيق لاحقًا كمصدر ثابت.
+    """
+    # إعادة استعمال نفس الدالة لضمان التطابق
+    p_next, _ = recency_softmax_probs(
+        df,
+        horizon=horizon,
+        temperature=temperature,
+        decay_half_life=decay_half_life,
+        bonus_boost=bonus_boost,
+    )
+    model = {
+        "type": "recency_softmax",
+        "p_next": p_next,                     # احتمالات السبن القادم لكل قطاع
+        "meta": {
+            "horizon": horizon,
+            "temperature": temperature,
+            "half_life": decay_half_life,
+            "bonus_boost": bonus_boost,
+            "trained_on_rows": int(len(df)),
+            "trained_at": datetime.utcnow().isoformat() + "Z",
+        },
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(model, f)
+    return model
+
+# زر التدريب
+if st.sidebar.button("💾 درِّب النموذج الآن", use_container_width=True):
+    if df.empty:
+        st.sidebar.error("لا توجد بيانات للتدريب.")
+    else:
+        try:
+            model_obj = train_and_save_model(
+                df,
+                model_path_input,
+                horizon=horizon,
+                temperature=temperature,
+                decay_half_life=decay_half_life,
+                bonus_boost=bonus_boost,
+            )
+            st.sidebar.success(f"تم حفظ النموذج: {model_path_input}")
+            # زر لتحميل الملف الناتج (حتى ترفعه للمستودع لاحقًا)
+            with open(model_path_input, "rb") as fh:
+                st.sidebar.download_button(
+                    label="⬇️ تحميل النموذج",
+                    data=fh.read(),
+                    file_name="pattern_model.pkl",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+        except Exception as e:
+            st.sidebar.error(f"فشل التدريب: {e}")
+
+st.sidebar.markdown("---")
+st.sidebar.caption("نصيحة: بعد تحميل pattern_model.pkl ارفعه إلى مجلد models/ في GitHub ليبقى دائمًا.")
