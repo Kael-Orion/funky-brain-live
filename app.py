@@ -84,7 +84,6 @@ def section_header(title):
 # ---------- تخمين القطاع من اسم ملف الصورة ----------
 def _guess_segment_from_url(url: str) -> str | None:
     s = str(url).lower()
-    # الترتيب مهم (vip قبل disco)
     patterns = [
         (r"(disco[_\-]?(vip|v|vip1)|discovip)", "DISCO_VIP"),
         (r"(stay[_\-]?(in)?alive|stayinalive|stayalive)", "STAYINALIVE"),
@@ -92,45 +91,31 @@ def _guess_segment_from_url(url: str) -> str | None:
         (r"/disco(\.png|\.jpg|/|$)", "DISCO"),
         (r"/1(\.png|\.jpg|/|$)", "1"),
     ]
-    # حروف PLAY/FUNKY/TIME
-    letters = list("PLAYFUNKYTIME")
-    for L in letters:
+    for L in list("PLAYFUNKYTIME"):
         patterns.append((rf"/{L.lower()}(\.png|\.jpg|/|$)", L))
     for pat, lab in patterns:
         if re.search(pat, s):
             return lab
     return None
 
-# ---------- تحسين UNKNOWN+16X -> 1+1X عندما يدل الرابط على ذلك ----------
-def _refine_unknown_with_url(df_raw: pd.DataFrame, seg_series: pd.Series, mult_series: pd.Series) -> tuple[pd.Series, pd.Series]:
-    # حاول إيجاد عمود رابط
+def _refine_unknown_with_url(df_raw: pd.DataFrame, seg_series: pd.Series, mult_series: pd.Series):
     url_col = None
     for c in ["image","img","src","url","href"]:
         if c in df_raw.columns:
-            url_col = c
-            break
+            url_col = c; break
     if url_col is None:
         return seg_series, mult_series
-
     hints = df_raw[url_col].astype(str).apply(_guess_segment_from_url)
     mask = (seg_series.str.upper().eq("UNKNOWN")) & (mult_series.str.upper().eq("16X")) & (hints=="1")
-    seg_series = seg_series.copy()
-    mult_series = mult_series.copy()
-    seg_series.loc[mask] = "1"
-    mult_series.loc[mask] = "1X"
+    seg_series = seg_series.copy(); mult_series = mult_series.copy()
+    seg_series.loc[mask] = "1"; mult_series.loc[mask] = "1X"
     return seg_series, mult_series
 
-# ---------- منظّف مرن للصفوف ----------
+# ---------- منظّف مرن ----------
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - يبني ts من (ts|timestamp|datetime) أو من (date+time) أو يلتقط عمودًا يشبه التاريخ/الوقت
-    - يلتقط multiplier من أي عمود قيمه على نمط \d+X (أو أرقام) ويحوّلها لشكل "12X"
-    - يشتق segment من أعمدة معروفة أو من رابط الصورة
-    - يصلّح UNKNOWN+16X -> 1+1X عندما يدلّ اسم الصورة على ذلك
-    """
     df_raw = df.copy()
 
-    # ===== ts =====
+    # ts
     ts_col = None
     for cand in ["ts", "timestamp", "datetime"]:
         if cand in df_raw.columns:
@@ -139,44 +124,39 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
         df_raw["ts"] = (df_raw["date"].astype(str).str.strip() + " " + df_raw["time"].astype(str).str.strip())
         ts_col = "ts"
     if ts_col is None:
-        # التقط عمودًا يشبه التاريخ/الوقت
         for c in df_raw.columns:
             sample = str(df_raw[c].astype(str).dropna().head(6).tolist())
             if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", sample) or re.search(r"\d{1,2}:\d{2}", sample):
                 ts_col = c; break
     if ts_col is None:
         raise ValueError("Column missing: ts")
-
     ts = pd.to_datetime(df_raw[ts_col], errors="coerce")
 
-    # ===== multiplier =====
+    # multiplier
     mult_col = "multiplier" if "multiplier" in df_raw.columns else None
     if mult_col is None:
         for c in df_raw.columns:
             vals = df_raw[c].astype(str)
-            if (vals.str.contains(r"\d+\s*[xX]$", regex=True).mean() > 0.3) or (vals.str.contains(r"^\s*\d+\s*(?:x|X)?\s*$", regex=True).mean() > 0.5):
+            if (vals.str.contains(r"\d+\s*[xX]$", regex=True).mean() > 0.3) or \
+               (vals.str.contains(r"^\s*\d+\s*(?:x|X)?\s*$", regex=True).mean() > 0.5):
                 mult_col = c; break
     if mult_col is None:
-        # كحل أخير: أي عمود عددي غالبًا
         num_like = [c for c in df_raw.columns if pd.to_numeric(df_raw[c], errors="coerce").notna().mean() > 0.5]
         if num_like: mult_col = num_like[0]
         else: raise ValueError("Column missing: multiplier")
-
     mult = (
         df_raw[mult_col].astype(str)
-          .str.extract(r"(\d+)\s*[xX]?", expand=False)
-          .fillna("1").astype(int).astype(str) + "X"
+        .str.extract(r"(\d+)\s*[xX]?", expand=False)
+        .fillna("1").astype(int).astype(str) + "X"
     )
 
-    # ===== segment =====
+    # segment
     seg_col = "segment" if "segment" in df_raw.columns else None
     if seg_col is None:
         for c in ["symbol","result","letter","tile","name"]:
             if c in df_raw.columns:
                 seg_col = c; break
-
     if seg_col is None:
-        # من الرابط
         url_col = None
         for c in ["image","img","src","url","href"]:
             if c in df_raw.columns:
@@ -189,10 +169,7 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
         seg = df_raw[seg_col].astype(str).str.strip().str.upper()
 
     seg = seg.str.upper().replace({"ONE":"1"})
-    # لو segment = 1 → multiplier = 1X
     mult = mult.where(~seg.eq("1"), "1X")
-
-    # تحسين UNKNOWN+16X عبر رابط الصورة (إن توفر)
     seg, mult = _refine_unknown_with_url(df_raw, seg, mult)
 
     out = pd.DataFrame({"ts": ts, "segment": seg, "multiplier": mult})
@@ -209,7 +186,6 @@ def combine_inside_streamlit() -> tuple[int, str]:
             paths.append(os.path.join(DATA_DIR, name))
     if not paths:
         return 0, "لم يتم العثور على ملفات تبدأ بـ spins_cleaned داخل data/."
-
     frames = []
     for p in sorted(paths):
         try:
@@ -217,7 +193,6 @@ def combine_inside_streamlit() -> tuple[int, str]:
             frames.append(clean_df(df))
         except Exception as e:
             st.warning(f"تجاوز {os.path.basename(p)}: {e}")
-
     if not frames: return 0, "لم أستطع قراءة أي ملف صالح."
     big = pd.concat(frames, ignore_index=True)
     big = big.drop_duplicates(subset=["ts","segment","multiplier"]).sort_values("ts").reset_index(drop=True)
@@ -233,8 +208,9 @@ def clean_and_append_uploaded(upload_file) -> pd.DataFrame:
 
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(REPO_COMBINED_PATH):
-        base = pd.read_csv(REPO_COMBINED_PATH)
-        base = clean_df(base) if set(base.columns) != {"ts","segment","multiplier"} else base
+        # ✅ إصلاح التعارض: طبّق clean_df دومًا على الملف الموجود لتوحيد الأنواع (ts كـ datetime)
+        base_raw = pd.read_csv(REPO_COMBINED_PATH)
+        base = clean_df(base_raw)
         out = (pd.concat([base, cleaned], ignore_index=True)
                  .drop_duplicates(subset=["ts","segment","multiplier"])
                  .sort_values("ts").reset_index(drop=True))
@@ -335,7 +311,6 @@ with st.sidebar:
     st.write("---")
     st.subheader("🧩 إدارة البيانات")
 
-    # زر دمج الملفات داخل data/
     if st.button("🔁 دمج ملفات data/spins_cleaned*.csv(xlsx) → combined_spins.csv", use_container_width=True):
         rows, msg = combine_inside_streamlit()
         if rows>0:
@@ -344,7 +319,6 @@ with st.sidebar:
         else:
             st.warning(msg)
 
-    # تنزيل الملف المدموج
     if os.path.exists(REPO_COMBINED_PATH):
         with open(REPO_COMBINED_PATH, "rb") as f:
             st.download_button("⬇️ تنزيل combined_spins.csv", f.read(), file_name="combined_spins.csv", mime="text/csv", use_container_width=True)
@@ -355,7 +329,6 @@ with st.sidebar:
     sheet_url = st.text_input("رابط Google Sheets (CSV export)", value="")
     upload = st.file_uploader("…أو ارفع ملف CSV/Excel", type=["csv","xlsx","xls"])
 
-    # زر تنظيف + إضافة للملف المرفوع (لا يعتمد على المصدر المختار للعرض)
     if upload is not None:
         if st.button("🧹 تنظيف + إضافة إلى combined_spins.csv", use_container_width=True):
             try:
@@ -372,21 +345,18 @@ with st.sidebar:
     use_learned = st.toggle("استخدم النموذج المتعلّم إن وجد", value=False)
     model_path = st.text_input("مسار ملف النموذج", value="models/pattern_model.pkl")
 
-# تحميل الداتا (للعرض والتكهّن)
+# تحميل الداتا
 df = load_data(upload if not use_repo_combined else None, sheet_url, window,
                use_repo_file=use_repo_combined, repo_path=REPO_COMBINED_PATH)
 if df.empty:
     st.info("أضف مصدر بيانات صالح يحتوي الأعمدة: ts, segment, multiplier")
     st.stop()
 
-# -------- اختيار مصدر الاحتمالات: recency أو model.pkl --------
-source_label = "recency"
-p_next = {}; p_in10 = {}
-
+# -------- اختيار مصدر الاحتمالات --------
+source_label = "recency"; p_next={}; p_in10={}
 if use_learned and os.path.exists(model_path):
     try:
-        with open(model_path, "rb") as fh:
-            model_obj = pickle.load(fh)
+        with open(model_path, "rb") as fh: model_obj = pickle.load(fh)
         if isinstance(model_obj, dict) and "p_next" in model_obj:
             p_next = model_obj["p_next"]
             p_in10 = {s: p_at_least_once(p_next.get(s,0.0), horizon) for s in ALL_SEGMENTS}
@@ -397,12 +367,8 @@ if use_learned and os.path.exists(model_path):
             st.warning("ملف النموذج لا يحتوي p_next — سيتم استخدام recency.")
     except Exception as e:
         st.warning(f"تعذر تحميل النموذج: {e}")
-
 if not p_next:
-    p_next, p_in10 = get_probs_recency(
-        df, horizon=horizon, temperature=temperature,
-        decay_half_life=decay_half_life, bonus_boost=bonus_boost
-    )
+    p_next, p_in10 = get_probs_recency(df, horizon=horizon, temperature=temperature, decay_half_life=decay_half_life, bonus_boost=bonus_boost)
 st.caption(f"Source of probabilities: {source_label}")
 
 # تبويبات
@@ -414,7 +380,6 @@ with tab_tiles:
     c1,c2,_,_=st.columns([1.2,1.2,0.1,0.1])
     with c1: display_tile("1", f"P(next) {pct(p_next.get('1',0))}", letter_color("1"))
     with c2: display_tile("BAR", f"P(next) {pct(p_next.get('BAR',0))}", letter_color("BAR"), txt_size=34)
-
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
     cols=st.columns(4)
     for i,L in enumerate(["P","L","A","Y"]):
@@ -446,7 +411,6 @@ with tab_board:
                           height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
     with c2: display_tile("BAR", f"≥1 in 10: {prob10('BAR')}", letter_color("BAR"),
                           height=TILE_H_SMALL, txt_size=TILE_TXT_SMALL, sub_size=TILE_SUB_SMALL)
-
     st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
     cols=st.columns(4)
     for i,L in enumerate(["P","L","A","Y"]):
@@ -495,7 +459,6 @@ with tab_table:
 # ========== Falcon Eye ==========
 with tab_falcon:
     section_header("عين الصقر — تنبيهات وتحذيرات")
-    # أي بونص ≥1 خلال 10/15/25
     any10=any15=any25=1.0
     for b in BONUS_SEGMENTS:
         pb=p_next.get(b,0.0)
@@ -518,7 +481,6 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # التقلب العام (بسيط)
     Wmini=min(30,len(df))
     if Wmini>=10:
         tail=df.tail(Wmini); counts=tail["segment"].value_counts(normalize=True)
@@ -532,16 +494,13 @@ with tab_falcon:
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
 
-    # تحذير: سيطرة محتملة للرقم 1 خلال 15
-    p1_next=p_next.get("1",0.0); p1_in15=p_at_least_once(p1_next,15)
-    color15="#D32F2F" if p1_in15>0.85 else "#37474F"
-    st.markdown(f"<div style='background:{color15};color:#fff;padding:14px;border-radius:12px'>⚠️ تحذير: سيطرة محتملة للرقم 1 خلال 15 سبِن — P(≥1 خلال 15) = {pct(p1_in15)}</div>", unsafe_allow_html=True)
-
-    # تحذير أحمر إذا P[X≥3] في 10 لِـ 1
     def binom_tail_ge_k(n,p,k):
         p=max(0.0,min(1.0,float(p))); total=0.0
         for r in range(0,k): total += math.comb(n,r)*(p**r)*((1-p)**(n-r))
         return 1.0-total
+    p1_next=p_next.get("1",0.0); p1_in15=p_at_least_once(p1_next,15)
+    color15="#D32F2F" if p1_in15>0.85 else "#37474F"
+    st.markdown(f"<div style='background:{color15};color:#fff;padding:14px;border-radius:12px'>⚠️ تحذير: سيطرة محتملة للرقم 1 خلال 15 سبِن — P(≥1 خلال 15) = {pct(p1_in15)}</div>", unsafe_allow_html=True)
     p1_ge3_in10 = binom_tail_ge_k(10, p1_next, 3)
     st.markdown(f"<div style='background:#B71C1C;color:#fff;padding:14px;border-radius:12px'>🛑 تنبيه حاد: احتمال تكرار الرقم <b>1</b> ثلاث مرات أو أكثر خلال 10 سبِن = <b>{pct(p1_ge3_in10)}</b> — يُنصح بالتوقف المؤقت.</div>", unsafe_allow_html=True)
 
